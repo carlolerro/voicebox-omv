@@ -22,7 +22,13 @@ sys.modules["backend.utils.cache"] = _cache_stub
 from backend import config
 from backend.database import Base
 from backend.database import Capture as DBCapture
-from backend.mcp_server.profile_tools import add_profile_sample, create_profile
+from backend.database import ProfileSample as DBProfileSample
+from backend.database import VoiceProfile as DBVoiceProfile
+from backend.mcp_server.profile_tools import (
+    add_profile_sample,
+    create_profile,
+    get_profile,
+)
 
 
 class MCPProfileToolsRegressionTestCase(unittest.IsolatedAsyncioTestCase):
@@ -95,6 +101,31 @@ class MCPProfileToolsRegressionTestCase(unittest.IsolatedAsyncioTestCase):
                     reference_text=None,
                     db=self.db,
                 )
+
+    async def test_designed_profile_never_uses_clone_readiness(self) -> None:
+        self.db.add(
+            DBVoiceProfile(
+                id="designed-profile",
+                name="Designed Legacy",
+                description=None,
+                language="en",
+                voice_type="designed",
+                design_prompt="A calm synthetic narrator.",
+            )
+        )
+        self.db.add(
+            DBProfileSample(
+                id="legacy-sample",
+                profile_id="designed-profile",
+                audio_path="profiles/legacy.wav",
+                reference_text="Legacy sample.",
+            )
+        )
+        self.db.commit()
+
+        result = await get_profile("Designed Legacy", self.db)
+        self.assertEqual(result["sample_count"], 1)
+        self.assertFalse(result["ready_for_generation"])
 
 
 if __name__ == "__main__":
