@@ -1,5 +1,6 @@
 name: Apply MCP profile management
 
+# This workflow is temporary and removes the staging script after verification.
 on:
   push:
     branches:
