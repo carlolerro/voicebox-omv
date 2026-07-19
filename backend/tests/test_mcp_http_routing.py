@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 
-from backend.spa_frontend import mount_frontend
+from backend.routes.oauth_discovery import router as oauth_discovery_router
 
 
 class MCPHttpRoutingTestCase(unittest.TestCase):
@@ -24,7 +25,12 @@ class MCPHttpRoutingTestCase(unittest.TestCase):
 
     def _client(self) -> TestClient:
         application = FastAPI()
-        mount_frontend(application, self.frontend_dir)
+        application.include_router(oauth_discovery_router)
+
+        @application.get("/{full_path:path}")
+        async def serve_spa(full_path: str):
+            return HTMLResponse("<html><body>Voicebox</body></html>")
+
         return TestClient(application)
 
     def test_oauth_protected_resource_metadata_is_not_served_by_spa(self) -> None:
