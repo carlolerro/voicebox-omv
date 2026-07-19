@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 def register_routers(app: FastAPI) -> None:
     """Include all domain routers on the application."""
+    from .oauth_discovery import router as oauth_discovery_router
     from .health import router as health_router
     from .profiles import router as profiles_router
     from .channels import router as channels_router
@@ -26,6 +27,7 @@ def register_routers(app: FastAPI) -> None:
     from .events import router as events_router
     from .cloud import router as cloud_router
 
+    app.include_router(oauth_discovery_router)
     app.include_router(health_router)
     app.include_router(profiles_router)
     app.include_router(channels_router)
