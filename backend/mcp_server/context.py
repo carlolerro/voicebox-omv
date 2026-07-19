@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Scope
 
 
 logger = logging.getLogger(__name__)
@@ -39,31 +39,19 @@ current_remote_addr: ContextVar[str | None] = ContextVar(
 )
 
 
-class MCPPathMiddleware:
-    """Make the documented ``/mcp`` URL reach the ``/mcp/`` ASGI mount.
+def _normalize_mcp_path(scope: Scope) -> None:
+    """Make the documented exact ``/mcp`` URL reach the ``/mcp/`` mount.
 
-    Starlette mounts match ``/mcp/`` and descendants, but an exact POST to
+    Starlette mounts match ``/mcp/`` and descendants, while an exact POST to
     ``/mcp`` can otherwise fall through to Voicebox's GET-only SPA catch-all
-    and become ``405 Method Not Allowed``. Rewriting the ASGI scope avoids an
-    HTTP redirect and preserves the request method, body, headers, and query.
+    and become ``405 Method Not Allowed``. Mutating only the path fields keeps
+    the method, request body, headers, and query string unchanged and avoids an
+    HTTP redirect that remote MCP clients would have to follow.
     """
-
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def __call__(
-        self,
-        scope: Scope,
-        receive: Receive,
-        send: Send,
-    ) -> None:
-        if scope["type"] in {"http", "websocket"} and scope.get("path") == "/mcp":
-            normalized_scope = dict(scope)
-            normalized_scope["path"] = "/mcp/"
-            if normalized_scope.get("raw_path") == b"/mcp":
-                normalized_scope["raw_path"] = b"/mcp/"
-            scope = normalized_scope
-        await self.app(scope, receive, send)
+    if scope["type"] in {"http", "websocket"} and scope.get("path") == "/mcp":
+        scope["path"] = "/mcp/"
+        if scope.get("raw_path") == b"/mcp":
+            scope["raw_path"] = b"/mcp/"
 
 
 def request_is_loopback() -> bool:
@@ -100,13 +88,14 @@ _STAMPED_PATH_PREFIXES: tuple[str, ...] = ("/mcp", "/speak")
 
 
 class ClientIdMiddleware(BaseHTTPMiddleware):
-    """Copy X-Voicebox-Client-Id into a ContextVar and stamp last_seen_at
-    for requests that act on the caller's MCP bindings."""
+    """Normalize MCP routing, expose client identity, and stamp last-seen."""
 
     def __init__(self, app: ASGIApp) -> None:
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        _normalize_mcp_path(request.scope)
+
         client_id = request.headers.get(CLIENT_ID_HEADER)
         remote_addr = request.client.host if request.client else None
         client_token = current_client_id.set(client_id)
