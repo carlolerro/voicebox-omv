@@ -5,9 +5,12 @@ import unittest
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.testclient import TestClient
+from starlette.applications import Starlette
+from starlette.routing import Route
 
+from backend.mcp_server.context import MCPPathMiddleware
 from backend.routes.oauth_discovery import router as oauth_discovery_router
 
 
@@ -49,6 +52,25 @@ class MCPHttpRoutingTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers.get("content-type", ""))
         self.assertIn("Voicebox", response.text)
+
+    def test_exact_mcp_path_reaches_mounted_app_without_trailing_slash(self) -> None:
+        async def initialize(_request):
+            return JSONResponse({"transport": "mcp"})
+
+        mcp_app = Starlette(
+            routes=[Route("/", initialize, methods=["POST"])]
+        )
+        application = FastAPI()
+        application.add_middleware(MCPPathMiddleware)
+        application.mount("/mcp", mcp_app)
+
+        @application.get("/{full_path:path}")
+        async def serve_spa(full_path: str):
+            return HTMLResponse("<html><body>Voicebox</body></html>")
+
+        response = TestClient(application).post("/mcp")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"transport": "mcp"})
 
     def test_mcp_mount_precedes_spa_catch_all(self) -> None:
         app_source = (
