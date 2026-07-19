@@ -2,43 +2,40 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add four MCP tools that discover preset voices, create Voicebox profiles, retrieve complete profile metadata, and attach cloned-voice samples from strict Base64 audio or an existing Capture, while continuing to use `voicebox.speak` for generation.
+**Goal:** Add MCP tools for preset discovery, profile creation, complete profile retrieval, and cloned-voice sample attachment from Base64 or an existing Capture, while retaining `voicebox.speak` for generation.
 
-**Architecture:** Add a focused `backend/mcp_server/profile_tools.py` adapter with testable core functions that receive a SQLAlchemy session and thin FastMCP wrappers that open and close production sessions. Reuse `models.VoiceProfileCreate`, `services.profiles.create_profile`, `services.profiles.add_profile_sample`, Voicebox storage helpers, and the existing profile resolver. Move preset-voice discovery into `services/profiles.py` so REST and MCP use one implementation.
+**Architecture:** Create `backend/mcp_server/profile_tools.py` with core functions that accept a SQLAlchemy session and thin FastMCP wrappers that own production sessions. Reuse Voicebox profile services and storage helpers. Move preset discovery into `services/profiles.py` so REST and MCP share the same logic.
 
-**Tech Stack:** Python 3.11, FastMCP 3.x, FastAPI, Pydantic 2.x, SQLAlchemy 2.x, SQLite, standard-library `unittest`, Docker multi-stage build.
+**Tech Stack:** Python 3.11, FastMCP 3.x, FastAPI, Pydantic 2.x, SQLAlchemy 2.x, SQLite, standard-library `unittest`, Docker.
 
 ## Global Constraints
 
-- Work only on `feature/mcp-profile-management`.
-- Keep the MCP endpoint at `/mcp`; do not add another service or container.
-- Add exactly `voicebox.list_preset_voices`, `voicebox.create_profile`, `voicebox.get_profile`, and `voicebox.add_profile_sample`.
-- Keep `voicebox.speak` as the only generation tool; profile creation never generates audio.
-- Support only `voice_type="preset"` and `voice_type="cloned"` in the new creation tool.
-- Initial preset engines are exactly `kokoro` and `qwen_custom_voice`.
-- Cloning engines remain exactly `qwen`, `luxtts`, `chatterbox`, `chatterbox_turbo`, and `tada`.
-- Base64 samples use strict decoding, are limited to 50 MiB decoded, and never expose a client-supplied path.
-- Capture text precedence is explicit non-empty `reference_text`, then non-empty `transcript_raw`, then error; never use `transcript_refined` automatically.
-- Reject sample addition for all non-cloned profiles.
-- Do not add migrations, frontend changes, profile-test entities, comparison workflows, parallel TTS inference, export/import changes, or a new Docker build definition.
-- Tests must not run TTS inference or require a GPU.
+- Branch: `feature/mcp-profile-management`.
+- New tools: `voicebox.list_preset_voices`, `voicebox.create_profile`, `voicebox.get_profile`, `voicebox.add_profile_sample`.
+- Existing `/mcp` endpoint and `voicebox.speak` generation flow remain unchanged.
+- Creation accepts only `preset` and `cloned`; it never accepts audio and never generates audio.
+- Preset engines: `kokoro`, `qwen_custom_voice`.
+- Cloning engines remain those in `profiles.CLONING_ENGINES`.
+- Base64 decoding is strict; decoded maximum is 50 MiB; no client path parameter is exposed.
+- Capture text precedence: explicit `reference_text`, then `transcript_raw`, then error. Never select `transcript_refined` automatically.
+- Only cloned profiles accept samples.
+- No migrations, frontend changes, test/comparison entities, export/import changes, parallel TTS, new service, or new Dockerfile.
+- Tests use valid synthetic reference audio but never invoke TTS inference or require a GPU.
+
+## File Map
+
+- Create `backend/mcp_server/profile_tools.py` — core operations and MCP registration.
+- Create `backend/tests/__init__.py` — package marker.
+- Create `backend/tests/test_mcp_profile_tools.py` — isolated database/storage tests.
+- Modify `backend/services/profiles.py` — shared preset discovery.
+- Modify `backend/routes/profiles.py` — use shared discovery.
+- Modify `backend/mcp_server/tools.py` — register the new module.
+- Modify `backend/mcp_server/server.py` — update MCP instructions.
+- Modify `docs/content/docs/overview/mcp-server.mdx` — document the workflow.
 
 ---
 
-## File Structure
-
-- Create `backend/mcp_server/profile_tools.py`: core profile operations, Base64/Capture source handling, serialization, and MCP registration.
-- Create `backend/tests/__init__.py`: test package marker.
-- Create `backend/tests/test_mcp_profile_tools.py`: in-memory database and temporary-storage tests.
-- Modify `backend/services/profiles.py`: shared preset discovery.
-- Modify `backend/routes/profiles.py`: REST delegation to shared preset discovery.
-- Modify `backend/mcp_server/tools.py`: register profile tools.
-- Modify `backend/mcp_server/server.py`: advertise the new workflow.
-- Modify `docs/content/docs/overview/mcp-server.mdx`: document create → sample → speak.
-
----
-
-### Task 1: Shared Preset-Voice Discovery
+### Task 1: Shared Preset Discovery
 
 **Files:**
 - Modify: `backend/services/profiles.py`
@@ -47,14 +44,11 @@
 - Create: `backend/tests/test_mcp_profile_tools.py`
 
 **Interfaces:**
-- Consumes: existing `KOKORO_VOICES` and `QWEN_CUSTOM_VOICES` constants.
 - Produces: `profiles.list_preset_voices(engine: str) -> dict[str, object]`.
 
-- [ ] **Step 1: Write the failing preset-discovery tests**
+- [ ] **Step 1: Write the failing tests and fixture**
 
-Create an empty `backend/tests/__init__.py`.
-
-Create `backend/tests/test_mcp_profile_tools.py`:
+Create empty `backend/tests/__init__.py` and create `backend/tests/test_mcp_profile_tools.py`:
 
 ```python
 import base64
@@ -63,6 +57,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -74,12 +69,17 @@ from backend.services import profiles as profiles_service
 
 
 def make_wav_bytes() -> bytes:
+    """Three seconds of non-silent 16 kHz mono PCM, valid for clone checks."""
+    frames = bytearray()
+    for index in range(16_000 * 3):
+        sample = 4_000 if (index // 80) % 2 == 0 else -4_000
+        frames.extend(sample.to_bytes(2, "little", signed=True))
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(16_000)
-        wav.writeframes(b"\x00\x00" * 1_600)
+        wav.writeframes(bytes(frames))
     return buffer.getvalue()
 
 
@@ -125,19 +125,17 @@ class MCPProfileToolsTestCase(unittest.IsolatedAsyncioTestCase):
             profiles_service.list_preset_voices("unknown")
 ```
 
-- [ ] **Step 2: Run the tests and verify the failure**
+- [ ] **Step 2: Prove the tests fail**
+
+Run:
 
 ```bash
-python -m unittest \
-  backend.tests.test_mcp_profile_tools.MCPProfileToolsTestCase.test_list_kokoro_preset_voices \
-  backend.tests.test_mcp_profile_tools.MCPProfileToolsTestCase.test_list_qwen_custom_preset_voices \
-  backend.tests.test_mcp_profile_tools.MCPProfileToolsTestCase.test_list_preset_voices_rejects_unknown_engine \
-  -v
+python -m unittest backend.tests.test_mcp_profile_tools -v
 ```
 
-Expected: three failures because `profiles_service.list_preset_voices` does not exist.
+Expected: failures because `list_preset_voices` is absent.
 
-- [ ] **Step 3: Implement the shared service and REST delegation**
+- [ ] **Step 3: Implement shared discovery**
 
 Add after `CLONING_ENGINES` in `backend/services/profiles.py`:
 
@@ -146,61 +144,62 @@ PRESET_ENGINES = {"kokoro", "qwen_custom_voice"}
 
 
 def list_preset_voices(engine: str) -> dict[str, object]:
-    """Return normalized preset voice metadata for a supported engine."""
     if engine == "kokoro":
         from ..backends.kokoro_backend import KOKORO_VOICES
 
-        voices = [
-            {
-                "voice_id": voice_id,
-                "name": name,
-                "gender": gender,
-                "language": language,
-            }
-            for voice_id, name, gender, language in KOKORO_VOICES
-        ]
-        return {"engine": engine, "voices": voices}
-
+        return {
+            "engine": engine,
+            "voices": [
+                {
+                    "voice_id": voice_id,
+                    "name": name,
+                    "gender": gender,
+                    "language": language,
+                }
+                for voice_id, name, gender, language in KOKORO_VOICES
+            ],
+        }
     if engine == "qwen_custom_voice":
         from ..backends.qwen_custom_voice_backend import QWEN_CUSTOM_VOICES
 
-        voices = [
-            {
-                "voice_id": speaker_id,
-                "name": display_name,
-                "gender": gender,
-                "language": language,
-            }
-            for speaker_id, display_name, gender, language, _description in QWEN_CUSTOM_VOICES
-        ]
-        return {"engine": engine, "voices": voices}
-
+        return {
+            "engine": engine,
+            "voices": [
+                {
+                    "voice_id": speaker_id,
+                    "name": display_name,
+                    "gender": gender,
+                    "language": language,
+                }
+                for speaker_id, display_name, gender, language, _description
+                in QWEN_CUSTOM_VOICES
+            ],
+        }
     supported = ", ".join(sorted(PRESET_ENGINES))
     raise ValueError(
         f"Unsupported preset engine '{engine}'. Supported engines: {supported}."
     )
 ```
 
-Replace the current route implementation in `backend/routes/profiles.py`:
+Replace the REST route body:
 
 ```python
 @router.get("/profiles/presets/{engine}")
 async def list_preset_voices(engine: str):
-    """List available preset voices for an engine."""
     try:
         return profiles.list_preset_voices(engine)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 ```
 
-- [ ] **Step 4: Run tests and compilation**
+- [ ] **Step 4: Verify passing tests**
 
 ```bash
 python -m unittest backend.tests.test_mcp_profile_tools -v
 python -m compileall -q backend/services/profiles.py backend/routes/profiles.py
 ```
 
-Expected: three tests pass; compilation exits 0.
+Expected: tests pass; compilation exits 0.
 
 - [ ] **Step 5: Commit**
 
@@ -211,20 +210,16 @@ git commit -m "refactor: share preset voice discovery"
 
 ---
 
-### Task 2: Complete Profile Creation and Retrieval Core
+### Task 2: Profile Creation, Serialization, and Retrieval
 
 **Files:**
 - Create: `backend/mcp_server/profile_tools.py`
 - Modify: `backend/tests/test_mcp_profile_tools.py`
 
 **Interfaces:**
-- Consumes: `models.VoiceProfileCreate`, `profiles_service.create_profile`, and `profiles_service.get_profile_orm_by_name_or_id`.
-- Produces:
-  - `serialize_profile(profile: DBVoiceProfile, db: Session) -> dict[str, Any]`
-  - `create_profile(..., db: Session) -> dict[str, Any]`
-  - `get_profile(profile: str, db: Session) -> dict[str, Any]`
+- Produces `serialize_profile`, `create_profile`, and `get_profile`.
 
-- [ ] **Step 1: Add failing creation and retrieval tests**
+- [ ] **Step 1: Add failing tests**
 
 Append imports:
 
@@ -234,10 +229,10 @@ from backend.database import VoiceProfile as DBVoiceProfile
 from backend.mcp_server.profile_tools import create_profile, get_profile
 ```
 
-Append methods to `MCPProfileToolsTestCase`:
+Append tests:
 
 ```python
-    async def test_create_cloned_profile_returns_complete_metadata(self) -> None:
+    async def test_create_clone_returns_complete_metadata(self) -> None:
         result = await create_profile(
             name="Carlo",
             description="Voce italiana per spiegazioni tecniche.",
@@ -249,15 +244,13 @@ Append methods to `MCPProfileToolsTestCase`:
             preset_voice_id=None,
             db=self.db,
         )
-        self.assertEqual(result["name"], "Carlo")
         self.assertEqual(result["description"], "Voce italiana per spiegazioni tecniche.")
         self.assertEqual(result["personality"], "Carlo parla in modo concreto.")
-        self.assertEqual(result["voice_type"], "cloned")
         self.assertEqual(result["sample_count"], 0)
         self.assertEqual(result["generation_count"], 0)
         self.assertFalse(result["ready_for_generation"])
 
-    async def test_create_preset_profile_is_ready(self) -> None:
+    async def test_create_valid_preset_is_ready(self) -> None:
         voice_id = profiles_service.list_preset_voices("kokoro")["voices"][0]["voice_id"]
         result = await create_profile(
             name="Preset Person",
@@ -271,11 +264,10 @@ Append methods to `MCPProfileToolsTestCase`:
             db=self.db,
         )
         self.assertEqual(result["default_engine"], "kokoro")
-        self.assertEqual(result["preset_voice_id"], voice_id)
         self.assertTrue(result["ready_for_generation"])
 
-    async def test_create_profile_rejects_designed_type(self) -> None:
-        with self.assertRaisesRegex(ValueError, "voice_type must be 'cloned' or 'preset'"):
+    async def test_create_rejects_unsupported_profile_and_preset_engine(self) -> None:
+        with self.assertRaisesRegex(ValueError, "voice_type must be"):
             await create_profile(
                 name="Designed",
                 description=None,
@@ -287,11 +279,23 @@ Append methods to `MCPProfileToolsTestCase`:
                 preset_voice_id=None,
                 db=self.db,
             )
+        with self.assertRaisesRegex(ValueError, "Unsupported preset engine"):
+            await create_profile(
+                name="Unknown Preset",
+                description=None,
+                language="en",
+                voice_type="preset",
+                personality=None,
+                default_engine=None,
+                preset_engine="unknown",
+                preset_voice_id="voice",
+                db=self.db,
+            )
 
-    async def test_create_profile_preserves_native_validation(self) -> None:
+    async def test_create_preserves_native_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "Preset profiles require"):
             await create_profile(
-                name="Broken Preset",
+                name="Missing Voice",
                 description=None,
                 language="en",
                 voice_type="preset",
@@ -303,7 +307,7 @@ Append methods to `MCPProfileToolsTestCase`:
             )
         with self.assertRaisesRegex(ValueError, "Cloned profiles cannot use default engine"):
             await create_profile(
-                name="Broken Clone",
+                name="Invalid Clone",
                 description=None,
                 language="en",
                 voice_type="cloned",
@@ -314,7 +318,7 @@ Append methods to `MCPProfileToolsTestCase`:
                 db=self.db,
             )
 
-    async def test_create_profile_rejects_duplicate_name(self) -> None:
+    async def test_create_rejects_duplicate_name(self) -> None:
         arguments = dict(
             name="Duplicate",
             description=None,
@@ -330,7 +334,7 @@ Append methods to `MCPProfileToolsTestCase`:
         with self.assertRaisesRegex(ValueError, "already exists"):
             await create_profile(**arguments)
 
-    async def test_get_profile_by_case_insensitive_name_and_id(self) -> None:
+    async def test_get_by_id_or_case_insensitive_name(self) -> None:
         created = await create_profile(
             name="Case Display",
             description="Metadata",
@@ -342,17 +346,16 @@ Append methods to `MCPProfileToolsTestCase`:
             preset_voice_id=None,
             db=self.db,
         )
-        by_name = await get_profile("case display", self.db)
-        by_id = await get_profile(created["profile_id"], self.db)
-        self.assertEqual(by_name, by_id)
-        self.assertEqual(by_name["description"], "Metadata")
-        self.assertEqual(by_name["personality"], "Direct.")
+        self.assertEqual(
+            await get_profile("case display", self.db),
+            await get_profile(created["profile_id"], self.db),
+        )
 
-    async def test_get_profile_rejects_unknown_profile(self) -> None:
+    async def test_get_unknown_profile_errors(self) -> None:
         with self.assertRaisesRegex(ValueError, "Voice profile 'missing' was not found"):
             await get_profile("missing", self.db)
 
-    async def test_cloned_profile_readiness_uses_sample_count(self) -> None:
+    async def test_clone_readiness_uses_sample_count(self) -> None:
         created = await create_profile(
             name="Ready Later",
             description=None,
@@ -378,20 +381,20 @@ Append methods to `MCPProfileToolsTestCase`:
         self.assertTrue(result["ready_for_generation"])
 ```
 
-- [ ] **Step 2: Run and verify the missing-module failure**
+- [ ] **Step 2: Prove the module is missing**
 
 ```bash
 python -m unittest backend.tests.test_mcp_profile_tools -v
 ```
 
-Expected: import fails because `backend.mcp_server.profile_tools` does not exist.
+Expected: `ModuleNotFoundError` for `profile_tools`.
 
-- [ ] **Step 3: Implement profile serialization, creation, and retrieval**
+- [ ] **Step 3: Implement the core module**
 
 Create `backend/mcp_server/profile_tools.py`:
 
 ```python
-"""MCP tools for Voicebox voice-profile management."""
+"""MCP tools for Voicebox profile management."""
 
 from __future__ import annotations
 
@@ -415,31 +418,18 @@ from ..services import profiles as profiles_service
 
 MAX_PROFILE_SAMPLE_BYTES = 50 * 1024 * 1024
 ALLOWED_SAMPLE_SUFFIXES = {
-    ".wav",
-    ".mp3",
-    ".m4a",
-    ".ogg",
-    ".flac",
-    ".aac",
-    ".webm",
-    ".opus",
+    ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".webm", ".opus"
 }
 MCP_PROFILE_TYPES = {"cloned", "preset"}
 
 
 def serialize_profile(profile: DBVoiceProfile, db: Session) -> dict[str, Any]:
-    sample_count = (
-        db.query(func.count(DBProfileSample.id))
-        .filter(DBProfileSample.profile_id == profile.id)
-        .scalar()
-        or 0
-    )
-    generation_count = (
-        db.query(func.count(DBGeneration.id))
-        .filter(DBGeneration.profile_id == profile.id)
-        .scalar()
-        or 0
-    )
+    sample_count = db.query(func.count(DBProfileSample.id)).filter(
+        DBProfileSample.profile_id == profile.id
+    ).scalar() or 0
+    generation_count = db.query(func.count(DBGeneration.id)).filter(
+        DBGeneration.profile_id == profile.id
+    ).scalar() or 0
     voice_type = getattr(profile, "voice_type", None) or "cloned"
     ready = (
         bool(profile.preset_engine and profile.preset_voice_id)
@@ -483,6 +473,8 @@ async def create_profile(
 ) -> dict[str, Any]:
     if voice_type not in MCP_PROFILE_TYPES:
         raise ValueError("voice_type must be 'cloned' or 'preset'.")
+    if voice_type == "preset" and preset_engine is not None:
+        profiles_service.list_preset_voices(preset_engine)
     request = models.VoiceProfileCreate(
         name=name,
         description=description,
@@ -494,7 +486,7 @@ async def create_profile(
         preset_voice_id=preset_voice_id,
     )
     created = await profiles_service.create_profile(request, db)
-    row = db.query(DBVoiceProfile).filter(DBVoiceProfile.id == created.id).one()
+    row = db.query(DBVoiceProfile).filter_by(id=created.id).one()
     return serialize_profile(row, db)
 
 
@@ -502,135 +494,11 @@ async def get_profile(profile: str, db: Session) -> dict[str, Any]:
     return serialize_profile(_resolve_profile(profile, db), db)
 ```
 
-- [ ] **Step 4: Run the complete test module**
+- [ ] **Step 4: Verify tests**
 
 ```bash
 python -m unittest backend.tests.test_mcp_profile_tools -v
 python -m compileall -q backend/mcp_server/profile_tools.py
-```
-
-Expected: all tests pass; compilation exits 0.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add backend/mcp_server/profile_tools.py backend/tests/test_mcp_profile_tools.py
-git commit -m "feat: add MCP profile creation and retrieval core"
-```
-
----
-
-### Task 3: Strict Base64 Temporary-Audio Helper
-
-**Files:**
-- Modify: `backend/mcp_server/profile_tools.py`
-- Modify: `backend/tests/test_mcp_profile_tools.py`
-
-**Interfaces:**
-- Produces: `decoded_audio_file(audio_base64: str, filename: str | None) -> Iterator[Path]`.
-- Guarantees: strict decode, 50 MiB limit, supported suffix only, cleanup on normal and exceptional exit.
-
-- [ ] **Step 1: Add failing helper tests**
-
-Update the import:
-
-```python
-from backend.mcp_server.profile_tools import (
-    MAX_PROFILE_SAMPLE_BYTES,
-    create_profile,
-    decoded_audio_file,
-    get_profile,
-)
-```
-
-Append methods:
-
-```python
-    def test_decoded_audio_file_writes_and_removes_valid_audio(self) -> None:
-        encoded = base64.b64encode(make_wav_bytes()).decode("ascii")
-        with decoded_audio_file(encoded, "voice.wav") as path:
-            self.assertEqual(path.suffix, ".wav")
-            self.assertEqual(path.read_bytes(), make_wav_bytes())
-            saved_path = path
-        self.assertFalse(saved_path.exists())
-
-    def test_decoded_audio_file_uses_wav_for_unsupported_suffix(self) -> None:
-        encoded = base64.b64encode(make_wav_bytes()).decode("ascii")
-        with decoded_audio_file(encoded, "voice.exe") as path:
-            self.assertEqual(path.suffix, ".wav")
-
-    def test_decoded_audio_file_rejects_invalid_base64(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Invalid audio_base64"):
-            with decoded_audio_file("invalid%%%", "voice.wav"):
-                self.fail("invalid Base64 must not yield a path")
-
-    def test_decoded_audio_file_rejects_payload_over_50_mb(self) -> None:
-        encoded = base64.b64encode(
-            b"x" * (MAX_PROFILE_SAMPLE_BYTES + 1)
-        ).decode("ascii")
-        with self.assertRaisesRegex(ValueError, "cannot exceed 50 MB"):
-            with decoded_audio_file(encoded, "voice.wav"):
-                self.fail("oversized audio must not yield a path")
-
-    def test_decoded_audio_file_cleans_up_after_consumer_error(self) -> None:
-        encoded = base64.b64encode(make_wav_bytes()).decode("ascii")
-        saved_path = None
-        with self.assertRaisesRegex(RuntimeError, "consumer failed"):
-            with decoded_audio_file(encoded, "voice.wav") as path:
-                saved_path = path
-                raise RuntimeError("consumer failed")
-        self.assertIsNotNone(saved_path)
-        self.assertFalse(saved_path.exists())
-```
-
-- [ ] **Step 2: Run and verify the missing-symbol failure**
-
-```bash
-python -m unittest backend.tests.test_mcp_profile_tools -v
-```
-
-Expected: import fails because `decoded_audio_file` is not defined.
-
-- [ ] **Step 3: Implement the complete helper**
-
-Append to `backend/mcp_server/profile_tools.py`:
-
-```python
-def _sample_suffix(filename: str | None) -> str:
-    suffix = Path(filename or "").suffix.lower()
-    return suffix if suffix in ALLOWED_SAMPLE_SUFFIXES else ".wav"
-
-
-@contextmanager
-def decoded_audio_file(
-    audio_base64: str,
-    filename: str | None,
-) -> Iterator[Path]:
-    try:
-        raw = b64.b64decode(audio_base64, validate=True)
-    except Exception as exc:
-        raise ValueError(f"Invalid audio_base64: {exc}") from exc
-    if len(raw) > MAX_PROFILE_SAMPLE_BYTES:
-        raise ValueError("Profile samples cannot exceed 50 MB.")
-
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            suffix=_sample_suffix(filename),
-            delete=False,
-        ) as temporary:
-            temporary.write(raw)
-            temporary_path = Path(temporary.name)
-        yield temporary_path
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-```
-
-- [ ] **Step 4: Run helper and existing tests**
-
-```bash
-python -m unittest backend.tests.test_mcp_profile_tools -v
 ```
 
 Expected: all tests pass.
@@ -639,34 +507,127 @@ Expected: all tests pass.
 
 ```bash
 git add backend/mcp_server/profile_tools.py backend/tests/test_mcp_profile_tools.py
-git commit -m "feat: validate MCP Base64 audio safely"
+git commit -m "feat: add MCP profile creation and retrieval"
 ```
 
 ---
 
-### Task 4: Add Samples from Base64 or Capture
+### Task 3: Strict Base64 Temporary File Handling
 
 **Files:**
 - Modify: `backend/mcp_server/profile_tools.py`
 - Modify: `backend/tests/test_mcp_profile_tools.py`
 
 **Interfaces:**
-- Consumes: `_resolve_profile`, `decoded_audio_file`, `config.resolve_storage_path`, and `profiles_service.add_profile_sample`.
-- Produces: `add_profile_sample(..., db: Session) -> dict[str, Any]` supporting both approved sources.
+- Produces `decoded_audio_file(audio_base64, filename) -> Iterator[Path]` with guaranteed cleanup.
 
-- [ ] **Step 1: Add failing sample-operation tests**
+- [ ] **Step 1: Add failing tests**
 
-Append imports:
+Update the import to include `MAX_PROFILE_SAMPLE_BYTES` and `decoded_audio_file`, then append:
 
 ```python
-from backend.database import Capture as DBCapture
-from backend.mcp_server.profile_tools import add_profile_sample
+    def test_decoded_file_is_valid_and_removed(self) -> None:
+        encoded = base64.b64encode(make_wav_bytes()).decode("ascii")
+        with decoded_audio_file(encoded, "voice.wav") as path:
+            self.assertEqual(path.read_bytes(), make_wav_bytes())
+            saved = path
+        self.assertFalse(saved.exists())
+
+    def test_unsupported_filename_suffix_becomes_wav(self) -> None:
+        encoded = base64.b64encode(make_wav_bytes()).decode("ascii")
+        with decoded_audio_file(encoded, "voice.exe") as path:
+            self.assertEqual(path.suffix, ".wav")
+
+    def test_invalid_base64_errors(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Invalid audio_base64"):
+            with decoded_audio_file("invalid%%%", "voice.wav"):
+                self.fail("invalid data must not yield")
+
+    def test_size_limit_is_checked_on_decoded_bytes(self) -> None:
+        with patch("backend.mcp_server.profile_tools.MAX_PROFILE_SAMPLE_BYTES", 8):
+            encoded = base64.b64encode(b"123456789").decode("ascii")
+            with self.assertRaisesRegex(ValueError, "cannot exceed 50 MB"):
+                with decoded_audio_file(encoded, "voice.wav"):
+                    self.fail("oversized data must not yield")
+
+    def test_cleanup_occurs_when_consumer_raises(self) -> None:
+        encoded = base64.b64encode(make_wav_bytes()).decode("ascii")
+        saved = None
+        with self.assertRaisesRegex(RuntimeError, "consumer failure"):
+            with decoded_audio_file(encoded, "voice.wav") as path:
+                saved = path
+                raise RuntimeError("consumer failure")
+        self.assertIsNotNone(saved)
+        self.assertFalse(saved.exists())
 ```
 
-Append helpers and tests:
+- [ ] **Step 2: Prove the symbol is absent**
+
+```bash
+python -m unittest backend.tests.test_mcp_profile_tools -v
+```
+
+Expected: import failure for `decoded_audio_file`.
+
+- [ ] **Step 3: Implement strict decoding and cleanup**
+
+Append:
 
 ```python
-    async def _create_cloned_profile(self, name: str) -> dict:
+def _sample_suffix(filename: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in ALLOWED_SAMPLE_SUFFIXES else ".wav"
+
+
+@contextmanager
+def decoded_audio_file(audio_base64: str, filename: str | None) -> Iterator[Path]:
+    try:
+        raw = b64.b64decode(audio_base64, validate=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid audio_base64: {exc}") from exc
+    if len(raw) > MAX_PROFILE_SAMPLE_BYTES:
+        raise ValueError("Profile samples cannot exceed 50 MB.")
+
+    path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=_sample_suffix(filename), delete=False
+        ) as temporary:
+            temporary.write(raw)
+            path = Path(temporary.name)
+        yield path
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+```
+
+- [ ] **Step 4: Verify tests and commit**
+
+```bash
+python -m unittest backend.tests.test_mcp_profile_tools -v
+git add backend/mcp_server/profile_tools.py backend/tests/test_mcp_profile_tools.py
+git commit -m "feat: validate MCP Base64 samples safely"
+```
+
+Expected: tests pass and commit succeeds.
+
+---
+
+### Task 4: Base64 and Capture Sample Attachment
+
+**Files:**
+- Modify: `backend/mcp_server/profile_tools.py`
+- Modify: `backend/tests/test_mcp_profile_tools.py`
+
+**Interfaces:**
+- Produces `add_profile_sample(..., db) -> dict[str, Any]`.
+
+- [ ] **Step 1: Add failing operation tests**
+
+Import `DBCapture` and `add_profile_sample`. Add helpers:
+
+```python
+    async def _create_clone(self, name: str) -> dict:
         return await create_profile(
             name=name,
             description=None,
@@ -679,31 +640,34 @@ Append helpers and tests:
             db=self.db,
         )
 
-    def _create_capture(
+    def _capture(
         self,
-        *,
         capture_id: str,
         transcript_raw: str,
         transcript_refined: str | None = None,
         write_audio: bool = True,
-    ) -> DBCapture:
+    ) -> None:
         path = config.get_captures_dir() / f"{capture_id}.wav"
         if write_audio:
             path.write_bytes(make_wav_bytes())
-        capture = DBCapture(
-            id=capture_id,
-            audio_path=config.to_storage_path(path),
-            source="file",
-            language="en",
-            transcript_raw=transcript_raw,
-            transcript_refined=transcript_refined,
+        self.db.add(
+            DBCapture(
+                id=capture_id,
+                audio_path=config.to_storage_path(path),
+                source="file",
+                language="en",
+                transcript_raw=transcript_raw,
+                transcript_refined=transcript_refined,
+            )
         )
-        self.db.add(capture)
         self.db.commit()
-        return capture
+```
 
-    async def test_add_base64_sample_makes_clone_ready(self) -> None:
-        profile = await self._create_cloned_profile("Base64 Clone")
+Add tests:
+
+```python
+    async def test_base64_sample_makes_clone_ready(self) -> None:
+        profile = await self._create_clone("Base64 Clone")
         result = await add_profile_sample(
             profile=profile["profile_id"],
             audio_base64=base64.b64encode(make_wav_bytes()).decode("ascii"),
@@ -717,192 +681,137 @@ Append helpers and tests:
         self.assertEqual(result["sample_count"], 1)
         self.assertTrue(result["ready_for_generation"])
 
-    async def test_add_sample_requires_exactly_one_source(self) -> None:
-        profile = await self._create_cloned_profile("Source Rules")
-        with self.assertRaisesRegex(ValueError, "exactly one of audio_base64 or capture_id"):
+    async def test_exactly_one_source_and_base64_text_are_required(self) -> None:
+        profile = await self._create_clone("Rules")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
             await add_profile_sample(
-                profile=profile["profile_id"],
-                audio_base64=None,
-                capture_id=None,
-                filename=None,
-                reference_text="Text",
-                db=self.db,
+                profile=profile["profile_id"], audio_base64=None,
+                capture_id=None, filename=None, reference_text="Text", db=self.db
             )
-        with self.assertRaisesRegex(ValueError, "exactly one of audio_base64 or capture_id"):
+        with self.assertRaisesRegex(ValueError, "exactly one"):
             await add_profile_sample(
                 profile=profile["profile_id"],
                 audio_base64=base64.b64encode(make_wav_bytes()).decode("ascii"),
-                capture_id="capture-id",
-                filename="voice.wav",
-                reference_text="Text",
-                db=self.db,
+                capture_id="capture", filename="voice.wav",
+                reference_text="Text", db=self.db
             )
-
-    async def test_add_base64_sample_requires_reference_text(self) -> None:
-        profile = await self._create_cloned_profile("Base64 Text")
         with self.assertRaisesRegex(ValueError, "reference_text is required"):
             await add_profile_sample(
                 profile=profile["profile_id"],
                 audio_base64=base64.b64encode(make_wav_bytes()).decode("ascii"),
-                capture_id=None,
-                filename="voice.wav",
-                reference_text="   ",
-                db=self.db,
+                capture_id=None, filename="voice.wav",
+                reference_text="   ", db=self.db
             )
 
-    async def test_add_sample_rejects_preset_profile(self) -> None:
+    async def test_non_clone_rejects_samples(self) -> None:
         voice_id = profiles_service.list_preset_voices("kokoro")["voices"][0]["voice_id"]
         profile = await create_profile(
-            name="Preset No Samples",
-            description=None,
-            language="en",
-            voice_type="preset",
-            personality=None,
-            default_engine=None,
-            preset_engine="kokoro",
-            preset_voice_id=voice_id,
-            db=self.db,
+            name="Preset", description=None, language="en",
+            voice_type="preset", personality=None, default_engine=None,
+            preset_engine="kokoro", preset_voice_id=voice_id, db=self.db
         )
-        with self.assertRaisesRegex(ValueError, "cannot receive cloned voice samples"):
+        with self.assertRaisesRegex(ValueError, "Only cloned profiles"):
             await add_profile_sample(
                 profile=profile["profile_id"],
                 audio_base64=base64.b64encode(make_wav_bytes()).decode("ascii"),
-                capture_id=None,
-                filename="voice.wav",
-                reference_text="Text",
-                db=self.db,
+                capture_id=None, filename="voice.wav",
+                reference_text="Text", db=self.db
             )
 
-    async def test_capture_uses_explicit_text_before_raw(self) -> None:
-        profile = await self._create_cloned_profile("Capture Explicit")
-        self._create_capture(
-            capture_id="capture-explicit",
-            transcript_raw="Raw transcript.",
-            transcript_refined="Refined transcript.",
+    async def test_capture_text_precedence(self) -> None:
+        profile = await self._create_clone("Capture")
+        self._capture("explicit", "Raw text.", "Refined text.")
+        explicit = await add_profile_sample(
+            profile=profile["profile_id"], audio_base64=None,
+            capture_id="explicit", filename=None,
+            reference_text="Manual exact text.", db=self.db
         )
-        result = await add_profile_sample(
-            profile=profile["profile_id"],
-            audio_base64=None,
-            capture_id="capture-explicit",
-            filename=None,
-            reference_text="Exact manual transcript.",
-            db=self.db,
-        )
-        sample = self.db.query(DBProfileSample).filter_by(id=result["sample_id"]).one()
-        self.assertEqual(result["source"], "capture")
-        self.assertEqual(result["reference_text_source"], "explicit")
-        self.assertEqual(sample.reference_text, "Exact manual transcript.")
+        explicit_sample = self.db.query(DBProfileSample).filter_by(
+            id=explicit["sample_id"]
+        ).one()
+        self.assertEqual(explicit["reference_text_source"], "explicit")
+        self.assertEqual(explicit_sample.reference_text, "Manual exact text.")
 
-    async def test_capture_falls_back_only_to_raw_transcript(self) -> None:
-        profile = await self._create_cloned_profile("Capture Raw")
-        self._create_capture(
-            capture_id="capture-raw",
-            transcript_raw="Raw transcript only.",
-            transcript_refined="Refined text must not be selected.",
+        self._capture("raw", "Raw only.", "Must not be selected.")
+        raw = await add_profile_sample(
+            profile=profile["profile_id"], audio_base64=None,
+            capture_id="raw", filename=None, reference_text=None, db=self.db
         )
-        result = await add_profile_sample(
-            profile=profile["profile_id"],
-            audio_base64=None,
-            capture_id="capture-raw",
-            filename=None,
-            reference_text=None,
-            db=self.db,
-        )
-        sample = self.db.query(DBProfileSample).filter_by(id=result["sample_id"]).one()
-        self.assertEqual(result["reference_text_source"], "transcript_raw")
-        self.assertEqual(sample.reference_text, "Raw transcript only.")
+        raw_sample = self.db.query(DBProfileSample).filter_by(id=raw["sample_id"]).one()
+        self.assertEqual(raw["reference_text_source"], "transcript_raw")
+        self.assertEqual(raw_sample.reference_text, "Raw only.")
 
-    async def test_capture_errors_are_explicit(self) -> None:
-        profile = await self._create_cloned_profile("Capture Errors")
+    async def test_capture_errors_do_not_use_refined_text(self) -> None:
+        profile = await self._create_clone("Capture Errors")
         with self.assertRaisesRegex(ValueError, "Capture 'missing' was not found"):
             await add_profile_sample(
-                profile=profile["profile_id"],
-                audio_base64=None,
-                capture_id="missing",
-                filename=None,
-                reference_text=None,
-                db=self.db,
+                profile=profile["profile_id"], audio_base64=None,
+                capture_id="missing", filename=None,
+                reference_text=None, db=self.db
             )
-
-        self._create_capture(
-            capture_id="missing-audio",
-            transcript_raw="Raw.",
-            write_audio=False,
-        )
+        self._capture("missing-audio", "Raw.", write_audio=False)
         with self.assertRaisesRegex(ValueError, "audio file is unavailable"):
             await add_profile_sample(
-                profile=profile["profile_id"],
-                audio_base64=None,
-                capture_id="missing-audio",
-                filename=None,
-                reference_text=None,
-                db=self.db,
+                profile=profile["profile_id"], audio_base64=None,
+                capture_id="missing-audio", filename=None,
+                reference_text=None, db=self.db
             )
-
-        self._create_capture(
-            capture_id="refined-only",
-            transcript_raw="   ",
-            transcript_refined="Must not be used.",
-        )
+        self._capture("refined-only", "   ", "Must not be used.")
         with self.assertRaisesRegex(ValueError, "no usable transcript_raw"):
             await add_profile_sample(
-                profile=profile["profile_id"],
-                audio_base64=None,
-                capture_id="refined-only",
-                filename=None,
-                reference_text=None,
-                db=self.db,
+                profile=profile["profile_id"], audio_base64=None,
+                capture_id="refined-only", filename=None,
+                reference_text=None, db=self.db
             )
 
-    async def test_failed_sample_addition_preserves_profile(self) -> None:
-        profile = await self._create_cloned_profile("Survives Failure")
+    async def test_failed_sample_preserves_profile(self) -> None:
+        profile = await self._create_clone("Survives")
         with self.assertRaises(ValueError):
             await add_profile_sample(
-                profile=profile["profile_id"],
-                audio_base64="invalid%%%",
-                capture_id=None,
-                filename="bad.wav",
-                reference_text="Text",
-                db=self.db,
+                profile=profile["profile_id"], audio_base64="invalid%%%",
+                capture_id=None, filename="bad.wav",
+                reference_text="Text", db=self.db
             )
-        existing = self.db.query(DBVoiceProfile).filter_by(id=profile["profile_id"]).one_or_none()
-        self.assertIsNotNone(existing)
+        self.assertIsNotNone(
+            self.db.query(DBVoiceProfile).filter_by(id=profile["profile_id"]).one_or_none()
+        )
         self.assertEqual(
-            self.db.query(DBProfileSample).filter_by(profile_id=profile["profile_id"]).count(),
+            self.db.query(DBProfileSample).filter_by(
+                profile_id=profile["profile_id"]
+            ).count(),
             0,
         )
 ```
 
-- [ ] **Step 2: Run and verify the missing-symbol failure**
+- [ ] **Step 2: Prove `add_profile_sample` is absent**
 
 ```bash
 python -m unittest backend.tests.test_mcp_profile_tools -v
 ```
 
-Expected: import fails because `add_profile_sample` is not defined.
+Expected: import failure for `add_profile_sample`.
 
-- [ ] **Step 3: Implement normalized sample responses and both sources**
+- [ ] **Step 3: Implement both source paths**
 
-Append to `backend/mcp_server/profile_tools.py`:
+Append to `profile_tools.py`:
 
 ```python
-def _sample_result(
-    *,
+def _sample_response(
     profile: DBVoiceProfile,
     sample_id: str,
     source: str,
     reference_text_source: str,
     db: Session,
 ) -> dict[str, Any]:
-    serialized = serialize_profile(profile, db)
+    metadata = serialize_profile(profile, db)
     return {
         "profile_id": profile.id,
         "profile_name": profile.name,
         "sample_id": sample_id,
         "source": source,
         "reference_text_source": reference_text_source,
-        "sample_count": serialized["sample_count"],
-        "ready_for_generation": serialized["ready_for_generation"],
+        "sample_count": metadata["sample_count"],
+        "ready_for_generation": metadata["ready_for_generation"],
     }
 
 
@@ -915,86 +824,63 @@ async def add_profile_sample(
     reference_text: str | None,
     db: Session,
 ) -> dict[str, Any]:
-    profile_row = _resolve_profile(profile, db)
-    if (getattr(profile_row, "voice_type", None) or "cloned") != "cloned":
-        raise ValueError("Preset profiles cannot receive cloned voice samples.")
+    row = _resolve_profile(profile, db)
+    if (getattr(row, "voice_type", None) or "cloned") != "cloned":
+        raise ValueError("Only cloned profiles can receive cloned voice samples.")
     if bool(audio_base64) == bool(capture_id):
         raise ValueError("Pass exactly one of audio_base64 or capture_id.")
 
     if audio_base64 is not None:
-        clean_reference = (reference_text or "").strip()
-        if not clean_reference:
+        clean_text = (reference_text or "").strip()
+        if not clean_text:
             raise ValueError("reference_text is required for audio_base64 samples.")
-        with decoded_audio_file(audio_base64, filename) as temporary_path:
+        clean_text = models.ProfileSampleCreate(reference_text=clean_text).reference_text
+        with decoded_audio_file(audio_base64, filename) as path:
             sample = await profiles_service.add_profile_sample(
-                profile_row.id,
-                str(temporary_path),
-                clean_reference,
-                db,
+                row.id, str(path), clean_text, db
             )
-        return _sample_result(
-            profile=profile_row,
-            sample_id=sample.id,
-            source="base64",
-            reference_text_source="explicit",
-            db=db,
-        )
+        return _sample_response(row, sample.id, "base64", "explicit", db)
 
-    capture = db.query(DBCapture).filter(DBCapture.id == capture_id).first()
+    capture = db.query(DBCapture).filter_by(id=capture_id).first()
     if capture is None:
         raise ValueError(f"Capture '{capture_id}' was not found.")
-    capture_path = config.resolve_storage_path(capture.audio_path)
-    if capture_path is None or not capture_path.is_file():
+    path = config.resolve_storage_path(capture.audio_path)
+    if path is None or not path.is_file():
         raise ValueError(
             f"Capture '{capture_id}' exists, but its audio file is unavailable."
         )
 
-    explicit_reference = (reference_text or "").strip()
-    if explicit_reference:
-        resolved_reference = explicit_reference
-        reference_source = "explicit"
+    explicit = (reference_text or "").strip()
+    if explicit:
+        clean_text = models.ProfileSampleCreate(reference_text=explicit).reference_text
+        text_source = "explicit"
     else:
-        raw_reference = (capture.transcript_raw or "").strip()
-        if not raw_reference:
+        raw = (capture.transcript_raw or "").strip()
+        if not raw:
             raise ValueError(
-                f"Capture '{capture_id}' has no usable transcript_raw; pass reference_text explicitly."
+                f"Capture '{capture_id}' has no usable transcript_raw; "
+                "pass reference_text explicitly."
             )
-        resolved_reference = raw_reference
-        reference_source = "transcript_raw"
+        clean_text = models.ProfileSampleCreate(reference_text=raw).reference_text
+        text_source = "transcript_raw"
 
-    sample = await profiles_service.add_profile_sample(
-        profile_row.id,
-        str(capture_path),
-        resolved_reference,
-        db,
-    )
-    return _sample_result(
-        profile=profile_row,
-        sample_id=sample.id,
-        source="capture",
-        reference_text_source=reference_source,
-        db=db,
-    )
+    sample = await profiles_service.add_profile_sample(row.id, str(path), clean_text, db)
+    return _sample_response(row, sample.id, "capture", text_source, db)
 ```
 
-- [ ] **Step 4: Run the complete profile suite**
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 python -m unittest backend.tests.test_mcp_profile_tools -v
-```
-
-Expected: all tests pass without loading a TTS model.
-
-- [ ] **Step 5: Commit**
-
-```bash
 git add backend/mcp_server/profile_tools.py backend/tests/test_mcp_profile_tools.py
 git commit -m "feat: add MCP profile sample sources"
 ```
 
+Expected: all tests pass without TTS inference.
+
 ---
 
-### Task 5: FastMCP Registration and Existing-Tool Regression
+### Task 5: Register FastMCP Tools Without Regressing Existing Tools
 
 **Files:**
 - Modify: `backend/mcp_server/profile_tools.py`
@@ -1003,10 +889,9 @@ git commit -m "feat: add MCP profile sample sources"
 - Modify: `backend/tests/test_mcp_profile_tools.py`
 
 **Interfaces:**
-- Consumes: Task 1–4 core functions and `database.get_db`.
-- Produces: `register_profile_tools(mcp: FastMCP) -> None` and eight registered tool names.
+- Produces `register_profile_tools(mcp: FastMCP) -> None`.
 
-- [ ] **Step 1: Add the failing registration regression test**
+- [ ] **Step 1: Add a failing registration test**
 
 Append:
 
@@ -1022,14 +907,13 @@ class FakeMCP:
         def decorator(function):
             self.registered[name] = function
             return function
-
         return decorator
 ```
 
-Append to the test case:
+Add:
 
 ```python
-    def test_registration_contains_existing_and_profile_tools(self) -> None:
+    def test_all_existing_and_new_tools_are_registered(self) -> None:
         fake = FakeMCP()
         register_tools(fake)
         self.assertEqual(
@@ -1047,28 +931,25 @@ Append to the test case:
         )
 ```
 
-- [ ] **Step 2: Run and verify the four new names are absent**
+- [ ] **Step 2: Prove the new names are missing**
 
 ```bash
 python -m unittest \
-  backend.tests.test_mcp_profile_tools.MCPProfileToolsTestCase.test_registration_contains_existing_and_profile_tools \
+  backend.tests.test_mcp_profile_tools.MCPProfileToolsTestCase.test_all_existing_and_new_tools_are_registered \
   -v
 ```
 
-Expected: FAIL showing only the existing four tools are registered.
+Expected: failure listing the four missing names.
 
-- [ ] **Step 3: Add thin FastMCP wrappers**
+- [ ] **Step 3: Register thin wrappers**
 
-Append to `backend/mcp_server/profile_tools.py`:
+Append to `profile_tools.py`:
 
 ```python
 def register_profile_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         name="voicebox.list_preset_voices",
-        description=(
-            "List built-in voices for kokoro or qwen_custom_voice before "
-            "creating a preset profile."
-        ),
+        description="List built-in voices for kokoro or qwen_custom_voice.",
     )
     async def voicebox_list_preset_voices(engine: str) -> dict[str, Any]:
         return profiles_service.list_preset_voices(engine)
@@ -1076,9 +957,8 @@ def register_profile_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         name="voicebox.create_profile",
         description=(
-            "Create metadata for one Voicebox person. Use preset with "
-            "preset_engine/preset_voice_id, or cloned and attach audio later. "
-            "This tool never generates audio."
+            "Create metadata for one person as a preset or cloned profile. "
+            "This tool never accepts audio or generates speech."
         ),
     )
     async def voicebox_create_profile(
@@ -1094,15 +974,10 @@ def register_profile_tools(mcp: FastMCP) -> None:
         db = next(get_db())
         try:
             return await create_profile(
-                name=name,
-                description=description,
-                language=language,
-                voice_type=voice_type,
-                personality=personality,
-                default_engine=default_engine,
-                preset_engine=preset_engine,
-                preset_voice_id=preset_voice_id,
-                db=db,
+                name=name, description=description, language=language,
+                voice_type=voice_type, personality=personality,
+                default_engine=default_engine, preset_engine=preset_engine,
+                preset_voice_id=preset_voice_id, db=db
             )
         finally:
             db.close()
@@ -1125,8 +1000,7 @@ def register_profile_tools(mcp: FastMCP) -> None:
         name="voicebox.add_profile_sample",
         description=(
             "Attach a sample to a cloned profile. Pass exactly one of "
-            "audio_base64 or capture_id. Base64 requires reference_text; a "
-            "Capture uses explicit reference_text first, then transcript_raw."
+            "audio_base64 or capture_id."
         ),
     )
     async def voicebox_add_profile_sample(
@@ -1139,12 +1013,9 @@ def register_profile_tools(mcp: FastMCP) -> None:
         db = next(get_db())
         try:
             return await add_profile_sample(
-                profile=profile,
-                audio_base64=audio_base64,
-                capture_id=capture_id,
-                filename=filename,
-                reference_text=reference_text,
-                db=db,
+                profile=profile, audio_base64=audio_base64,
+                capture_id=capture_id, filename=filename,
+                reference_text=reference_text, db=db
             )
         finally:
             db.close()
@@ -1156,72 +1027,66 @@ Add to `backend/mcp_server/tools.py`:
 from .profile_tools import register_profile_tools
 ```
 
-At the end of `register_tools`, before the top-level speak-helper section:
+At the end of `register_tools`, before the top-level speak helper:
 
 ```python
     register_profile_tools(mcp)
 ```
 
-Replace the `instructions` value in `backend/mcp_server/server.py`:
+Replace server instructions:
 
 ```python
         instructions=(
-            "Voicebox is a local voice I/O layer. Use `voicebox.list_profiles` "
-            "and `voicebox.get_profile` to inspect voices; "
-            "`voicebox.list_preset_voices`, `voicebox.create_profile`, and "
-            "`voicebox.add_profile_sample` to create them; `voicebox.speak` "
-            "to generate and play speech; and `voicebox.transcribe` for audio→text."
+            "Voicebox is a local voice I/O layer. Inspect profiles with "
+            "`voicebox.list_profiles` and `voicebox.get_profile`; create them "
+            "with `voicebox.list_preset_voices`, `voicebox.create_profile`, "
+            "and `voicebox.add_profile_sample`; generate speech with "
+            "`voicebox.speak`; and transcribe audio with `voicebox.transcribe`."
         ),
 ```
 
-- [ ] **Step 4: Run registration, full tests, and compilation**
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 python -m unittest backend.tests.test_mcp_profile_tools -v
 python -m compileall -q backend/mcp_server backend/services backend/routes
-```
-
-Expected: all tests pass; compilation exits 0.
-
-- [ ] **Step 5: Commit**
-
-```bash
 git add backend/mcp_server backend/tests/test_mcp_profile_tools.py
 git commit -m "feat: expose profile management through MCP"
 ```
 
+Expected: all tests and compilation pass.
+
 ---
 
-### Task 6: Documentation and Existing Docker Build Verification
+### Task 6: Documentation, Docker Smoke Test, and Pull Request
 
 **Files:**
 - Modify: `docs/content/docs/overview/mcp-server.mdx`
 - Verify unchanged: `Dockerfile`, `docker-compose.yml`
 
 **Interfaces:**
-- Consumes: the registered live `/mcp` server.
-- Produces: workflow documentation and a non-GPU Docker smoke-test record.
+- Produces documented workflow and live `/mcp` evidence.
 
-- [ ] **Step 1: Document create → sample → speak**
+- [ ] **Step 1: Add workflow documentation**
 
-Add after the existing MCP tool documentation:
+Add:
 
 ```markdown
 ## Create a voice profile
 
-Profile creation and generation are separate:
+Profile creation and speech generation are separate:
 
-1. Discover a built-in voice with `voicebox.list_preset_voices`, or select a cloning engine.
+1. Discover a preset with `voicebox.list_preset_voices`, or choose a cloning engine.
 2. Create metadata with `voicebox.create_profile`.
-3. For cloned profiles, attach one or more references with `voicebox.add_profile_sample`.
-4. Generate audio with `voicebox.speak`.
+3. For cloned profiles, attach references with `voicebox.add_profile_sample`.
+4. Generate audio with the existing `voicebox.speak` tool.
 
-`description` is informational. `personality` controls in-character text rewriting when `voicebox.speak` is called with `personality: true`.
+`description` is informational. `personality` controls in-character rewriting when `voicebox.speak` is called with `personality: true`.
 
-A Base64 sample must include `reference_text`. A Capture sample may omit it; Voicebox then uses `transcript_raw`. `transcript_refined` is not selected automatically.
+Base64 samples require an exact `reference_text`. Capture samples use explicit `reference_text` first and otherwise `transcript_raw`; `transcript_refined` is not selected automatically.
 ```
 
-- [ ] **Step 2: Run non-GPU quality checks**
+- [ ] **Step 2: Run all non-GPU checks**
 
 ```bash
 python -m unittest discover -s backend/tests -p "test_mcp_profile_tools.py" -v
@@ -1230,26 +1095,18 @@ bun run typecheck
 bun run build:web
 ```
 
-Expected: tests and compilation pass; frontend checks complete without regressions.
+Expected: all checks pass.
 
-- [ ] **Step 3: Build the existing Dockerfile**
+- [ ] **Step 3: Build the existing image and start an isolated container**
 
 ```bash
 docker build -t voicebox-mcp-profile:test .
-```
-
-Expected: the existing three-stage image builds; no new Dockerfile is present.
-
-- [ ] **Step 4: Start an isolated container**
-
-```bash
 docker volume create voicebox-mcp-profile-test-data
 docker run -d --rm \
   --name voicebox-mcp-profile-test \
   -p 127.0.0.1:17601:17493 \
   -v voicebox-mcp-profile-test-data:/app/data \
   voicebox-mcp-profile:test
-
 for attempt in $(seq 1 60); do
   curl -fsS http://127.0.0.1:17601/health >/dev/null && break
   sleep 2
@@ -1259,47 +1116,42 @@ curl -fsS http://127.0.0.1:17601/health
 
 Expected: health succeeds within 120 seconds.
 
-- [ ] **Step 5: Verify all eight tools through live MCP**
+- [ ] **Step 4: Verify live tool discovery**
 
 ```bash
-docker exec voicebox-mcp-profile-test python - <<'PY'
+docker exec -i voicebox-mcp-profile-test python - <<'PY'
 import asyncio
 from fastmcp import Client
 
 EXPECTED = {
-    "voicebox.speak",
-    "voicebox.transcribe",
-    "voicebox.list_captures",
-    "voicebox.list_profiles",
-    "voicebox.list_preset_voices",
-    "voicebox.create_profile",
-    "voicebox.get_profile",
+    "voicebox.speak", "voicebox.transcribe", "voicebox.list_captures",
+    "voicebox.list_profiles", "voicebox.list_preset_voices",
+    "voicebox.create_profile", "voicebox.get_profile",
     "voicebox.add_profile_sample",
 }
 
 async def main():
     async with Client("http://127.0.0.1:17493/mcp") as client:
         names = {tool.name for tool in await client.list_tools()}
-        missing = EXPECTED - names
-        assert not missing, f"Missing MCP tools: {sorted(missing)}"
-        print("Verified:", sorted(EXPECTED))
+        assert not EXPECTED - names, sorted(EXPECTED - names)
+        print(sorted(EXPECTED))
 
 asyncio.run(main())
 PY
 ```
 
-Expected: all eight names are printed.
+Expected: eight tool names are printed.
 
-- [ ] **Step 6: Run a live metadata-only workflow**
+- [ ] **Step 5: Run a metadata-only live workflow**
 
 ```bash
-docker exec voicebox-mcp-profile-test python - <<'PY'
+docker exec -i voicebox-mcp-profile-test python - <<'PY'
 import asyncio
 from fastmcp import Client
 
 async def main():
     async with Client("http://127.0.0.1:17493/mcp") as client:
-        created = await client.call_tool(
+        print(await client.call_tool(
             "voicebox.create_profile",
             {
                 "name": "MCP Smoke Clone",
@@ -1309,69 +1161,25 @@ async def main():
                 "default_engine": "qwen",
                 "personality": "Parla in modo chiaro e diretto.",
             },
-        )
-        fetched = await client.call_tool(
-            "voicebox.get_profile",
-            {"profile": "mcp smoke clone"},
-        )
-        print(created)
-        print(fetched)
+        ))
+        print(await client.call_tool(
+            "voicebox.get_profile", {"profile": "mcp smoke clone"}
+        ))
 
 asyncio.run(main())
 PY
 ```
 
-Expected: both calls succeed; the fetched clone has zero samples and is not ready for generation.
+Expected: creation and lookup succeed; the clone has zero samples and is not ready.
 
-- [ ] **Step 7: Remove isolated resources**
+- [ ] **Step 6: Clean up, verify scope, and commit docs**
 
 ```bash
 docker stop voicebox-mcp-profile-test
 docker volume rm voicebox-mcp-profile-test-data
-```
-
-Expected: only the smoke-test container and volume are removed; production data is untouched.
-
-- [ ] **Step 8: Commit documentation**
-
-```bash
 git add docs/content/docs/overview/mcp-server.mdx
 git commit -m "docs: document MCP profile workflow"
-```
-
----
-
-### Task 7: Final Verification and Pull Request
-
-**Files:**
-- Review: all changes from Tasks 1–6
-- Compare: `feature/mcp-profile-management` against `main`
-
-**Interfaces:**
-- Consumes: tested feature branch.
-- Produces: a reviewable pull request; no automatic merge or OMV deployment.
-
-- [ ] **Step 1: Check final scope and whitespace**
-
-```bash
-git status --short
-git diff --stat main...HEAD
 git diff --check main...HEAD
-```
-
-Expected: clean tree and no whitespace errors.
-
-- [ ] **Step 2: Re-run focused tests**
-
-```bash
-python -m unittest discover -s backend/tests -p "test_mcp_profile_tools.py" -v
-```
-
-Expected: all tests pass.
-
-- [ ] **Step 3: Prove prohibited files were not changed**
-
-```bash
 if git diff --name-only main...HEAD | grep -E \
   'backend/database/migrations|app/src|backend/services/export_import.py|docker-compose.yml|Dockerfile'; then
   echo "Unexpected out-of-scope file change" >&2
@@ -1379,9 +1187,9 @@ if git diff --name-only main...HEAD | grep -E \
 fi
 ```
 
-Expected: no matched paths.
+Expected: smoke resources removed, documentation committed, no prohibited files changed.
 
-- [ ] **Step 4: Open the pull request**
+- [ ] **Step 7: Open the pull request**
 
 ```bash
 gh pr create \
@@ -1391,4 +1199,4 @@ gh pr create \
   --body "Adds preset discovery, profile creation, complete profile lookup, and Base64/Capture sample attachment through MCP. Reuses existing Voicebox services and keeps voicebox.speak as the generation tool. Includes non-GPU tests and Docker MCP smoke verification."
 ```
 
-Expected: a pull request is created for review and remains unmerged.
+Expected: a reviewable, unmerged pull request is created.
