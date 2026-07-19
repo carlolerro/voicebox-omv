@@ -3,12 +3,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.app import _mount_frontend
+from backend.spa_frontend import mount_frontend
 
 
 class MCPHttpRoutingTestCase(unittest.TestCase):
@@ -25,17 +24,7 @@ class MCPHttpRoutingTestCase(unittest.TestCase):
 
     def _client(self) -> TestClient:
         application = FastAPI()
-        expected_parent = Path(__file__).resolve().parent.parent.parent
-        fake_app_file = expected_parent / "backend" / "app.py"
-        with patch("backend.app.Path") as path_class:
-            path_class.side_effect = Path
-            path_class.return_value.resolve.return_value = fake_app_file
-            # _mount_frontend derives <repo>/frontend from __file__. Patch the
-            # resolved parent directly to point it at our isolated fixture.
-            path_class.return_value.resolve.return_value.parent.parent = (
-                self.frontend_dir.parent
-            )
-            _mount_frontend(application)
+        mount_frontend(application, self.frontend_dir)
         return TestClient(application)
 
     def test_oauth_protected_resource_metadata_is_not_served_by_spa(self) -> None:
@@ -54,6 +43,15 @@ class MCPHttpRoutingTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers.get("content-type", ""))
         self.assertIn("Voicebox", response.text)
+
+    def test_mcp_mount_precedes_spa_catch_all(self) -> None:
+        app_source = (
+            Path(__file__).resolve().parent.parent / "app.py"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            app_source.index('application.mount("/mcp", mcp_app)'),
+            app_source.index("_mount_frontend(application)"),
+        )
 
 
 if __name__ == "__main__":
