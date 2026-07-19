@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-from backend.mcp_server.context import MCPPathMiddleware
+from backend.mcp_server.context import ClientIdMiddleware
 from backend.routes.oauth_discovery import router as oauth_discovery_router
 
 
@@ -61,7 +61,7 @@ class MCPHttpRoutingTestCase(unittest.TestCase):
             routes=[Route("/", initialize, methods=["POST"])]
         )
         application = FastAPI()
-        application.add_middleware(MCPPathMiddleware)
+        application.add_middleware(ClientIdMiddleware)
         application.mount("/mcp", mcp_app)
 
         @application.get("/{full_path:path}")
