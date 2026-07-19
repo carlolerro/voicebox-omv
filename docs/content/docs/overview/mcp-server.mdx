@@ -109,6 +109,10 @@ for the shim to connect.
 | `voicebox.transcribe` | Whisper transcription of base64 audio or an absolute local path. |
 | `voicebox.list_captures` | Recent captures with transcripts, paginated. |
 | `voicebox.list_profiles` | Available voice profiles (cloned + preset). |
+| `voicebox.list_preset_voices` | Discover built-in Kokoro or Qwen CustomVoice speakers. |
+| `voicebox.create_profile` | Create preset or cloned profile metadata for one person. |
+| `voicebox.get_profile` | Read complete profile metadata, counts, and readiness. |
+| `voicebox.add_profile_sample` | Add a Base64 or existing Capture sample to a cloned profile. |
 
 ### `voicebox.speak`
 
@@ -159,6 +163,25 @@ clamped to `1..=200`.
 ### `voicebox.list_profiles`
 
 No args → `{ profiles: [{ id, name, voice_type, language, has_personality }] }`.
+
+## Create a voice profile
+
+Profile creation and speech generation are separate:
+
+1. Discover a preset with `voicebox.list_preset_voices`, or choose a cloning engine.
+2. Create the person's metadata with `voicebox.create_profile`.
+3. For cloned profiles, attach one or more references with `voicebox.add_profile_sample`.
+4. Generate audio with the existing `voicebox.speak` tool.
+
+`description` is informational. `personality` controls in-character rewriting
+when `voicebox.speak` is called with `personality: true`.
+
+Base64 samples require an exact `reference_text`. Capture samples use an
+explicit `reference_text` first and otherwise `transcript_raw`;
+`transcript_refined` is never selected automatically.
+
+A preset profile is ready immediately after successful creation. A cloned
+profile becomes ready after its first valid sample.
 
 ## Voice resolution
 
