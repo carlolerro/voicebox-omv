@@ -24,11 +24,7 @@ from backend.database import Base
 from backend.database import Capture as DBCapture
 from backend.database import ProfileSample as DBProfileSample
 from backend.database import VoiceProfile as DBVoiceProfile
-from backend.mcp_server.profile_tools import (
-    add_profile_sample,
-    create_profile,
-    get_profile,
-)
+from backend.mcp_server.profile_tools import add_profile_sample, create_profile, get_profile
 
 
 class MCPProfileToolsRegressionTestCase(unittest.IsolatedAsyncioTestCase):
@@ -73,6 +69,62 @@ class MCPProfileToolsRegressionTestCase(unittest.IsolatedAsyncioTestCase):
         await self._create_clone("Carlo")
         with self.assertRaisesRegex(ValueError, "already exists"):
             await self._create_clone("carlo")
+
+    async def test_qwen_custom_voice_preset_is_ready(self) -> None:
+        qwen = ModuleType("backend.backends.qwen_custom_voice_backend")
+        qwen.QWEN_CUSTOM_VOICES = [
+            ("Ryan", "Ryan", "male", "en", "Dynamic voice"),
+        ]
+        with patch.dict(
+            sys.modules,
+            {"backend.backends.qwen_custom_voice_backend": qwen},
+        ):
+            result = await create_profile(
+                name="Qwen Ryan",
+                description="Qwen preset voice.",
+                language="en",
+                voice_type="preset",
+                personality=None,
+                default_engine=None,
+                preset_engine="qwen_custom_voice",
+                preset_voice_id="Ryan",
+                db=self.db,
+            )
+        self.assertEqual(result["default_engine"], "qwen_custom_voice")
+        self.assertTrue(result["ready_for_generation"])
+
+    async def test_unknown_preset_voice_is_rejected(self) -> None:
+        kokoro = ModuleType("backend.backends.kokoro_backend")
+        kokoro.KOKORO_VOICES = [
+            ("if_sara", "Sara", "female", "it"),
+        ]
+        with patch.dict(
+            sys.modules,
+            {"backend.backends.kokoro_backend": kokoro},
+        ):
+            with self.assertRaisesRegex(ValueError, "is not valid"):
+                await create_profile(
+                    name="Unknown Kokoro Voice",
+                    description=None,
+                    language="it",
+                    voice_type="preset",
+                    personality=None,
+                    default_engine=None,
+                    preset_engine="kokoro",
+                    preset_voice_id="not-a-voice",
+                    db=self.db,
+                )
+
+    async def test_add_sample_rejects_missing_profile(self) -> None:
+        with self.assertRaisesRegex(ValueError, "was not found"):
+            await add_profile_sample(
+                profile="missing-profile",
+                audio_base64="AA==",
+                capture_id=None,
+                filename="sample.wav",
+                reference_text="Exact text.",
+                db=self.db,
+            )
 
     async def test_capture_sample_obeys_decoded_size_limit(self) -> None:
         profile = await self._create_clone("Capture Limit")
