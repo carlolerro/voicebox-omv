@@ -24,7 +24,12 @@ from backend.database import Base
 from backend.database import Capture as DBCapture
 from backend.database import ProfileSample as DBProfileSample
 from backend.database import VoiceProfile as DBVoiceProfile
-from backend.mcp_server.profile_tools import add_profile_sample, create_profile, get_profile
+from backend.mcp_server.profile_tools import (
+    add_profile_sample,
+    create_profile,
+    decoded_audio_file,
+    get_profile,
+)
 
 
 class MCPProfileToolsRegressionTestCase(unittest.IsolatedAsyncioTestCase):
@@ -125,6 +130,18 @@ class MCPProfileToolsRegressionTestCase(unittest.IsolatedAsyncioTestCase):
                 reference_text="Exact text.",
                 db=self.db,
             )
+
+    def test_oversized_base64_is_rejected_before_decode(self) -> None:
+        with patch(
+            "backend.mcp_server.profile_tools.MAX_PROFILE_SAMPLE_BYTES", 8
+        ):
+            with patch(
+                "backend.mcp_server.profile_tools.b64.b64decode"
+            ) as decoder:
+                with self.assertRaisesRegex(ValueError, "cannot exceed 50 MB"):
+                    with decoded_audio_file("A" * 16, "sample.wav"):
+                        self.fail("oversized input must not yield")
+                decoder.assert_not_called()
 
     async def test_capture_sample_obeys_decoded_size_limit(self) -> None:
         profile = await self._create_clone("Capture Limit")
