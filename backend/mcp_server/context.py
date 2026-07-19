@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,33 @@ current_client_id: ContextVar[str | None] = ContextVar(
 current_remote_addr: ContextVar[str | None] = ContextVar(
     "current_remote_addr", default=None
 )
+
+
+class MCPPathMiddleware:
+    """Make the documented ``/mcp`` URL reach the ``/mcp/`` ASGI mount.
+
+    Starlette mounts match ``/mcp/`` and descendants, but an exact POST to
+    ``/mcp`` can otherwise fall through to Voicebox's GET-only SPA catch-all
+    and become ``405 Method Not Allowed``. Rewriting the ASGI scope avoids an
+    HTTP redirect and preserves the request method, body, headers, and query.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] in {"http", "websocket"} and scope.get("path") == "/mcp":
+            normalized_scope = dict(scope)
+            normalized_scope["path"] = "/mcp/"
+            if normalized_scope.get("raw_path") == b"/mcp":
+                normalized_scope["raw_path"] = b"/mcp/"
+            scope = normalized_scope
+        await self.app(scope, receive, send)
 
 
 def request_is_loopback() -> bool:
