@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastmcp import FastMCP
 
 from .context import ClientIdMiddleware
+from .profile_tools import register_profile_tools
 from .tools import register_tools
 
 
@@ -27,13 +28,15 @@ def build_mcp_server() -> FastMCP:
     mcp = FastMCP(
         name="voicebox",
         instructions=(
-            "Voicebox is a local voice I/O layer. Use `voicebox.speak` to "
-            "play text in a voice profile, `voicebox.transcribe` for "
-            "audio→text, and the `list_*` tools to discover profiles and "
-            "captures."
+            "Voicebox is a local voice I/O layer. Inspect profiles with "
+            "`voicebox.list_profiles` and `voicebox.get_profile`; create them "
+            "with `voicebox.list_preset_voices`, `voicebox.create_profile`, "
+            "and `voicebox.add_profile_sample`; generate speech with "
+            "`voicebox.speak`; and transcribe audio with `voicebox.transcribe`."
         ),
     )
     register_tools(mcp)
+    register_profile_tools(mcp)
     return mcp
 
 
