@@ -22,10 +22,10 @@ cd "$ROOT_DIR"
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || true
 
-echo "[1/6] Building the existing Voicebox Docker image..."
+echo "[1/7] Building the existing Voicebox Docker image..."
 docker build -t "$IMAGE_NAME" .
 
-echo "[2/6] Starting an isolated Voicebox container..."
+echo "[2/7] Starting an isolated Voicebox container..."
 docker volume create "$DATA_VOLUME" >/dev/null
 docker run -d \
   --name "$CONTAINER_NAME" \
@@ -35,7 +35,7 @@ docker run -d \
   -e NUMBA_CACHE_DIR=/tmp/numba_cache \
   "$IMAGE_NAME" >/dev/null
 
-echo "[3/6] Waiting for /health..."
+echo "[3/7] Waiting for /health..."
 healthy=0
 for _attempt in $(seq 1 90); do
   if curl -fsS "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; then
@@ -52,12 +52,69 @@ fi
 curl -fsS "http://127.0.0.1:${HOST_PORT}/health"
 echo
 
-echo "[4/6] Running non-GPU unit tests and syntax compilation..."
+echo "[4/7] Running non-GPU MCP tests and syntax compilation..."
 docker exec "$CONTAINER_NAME" \
-  python -m unittest discover -s backend/tests -p 'test_mcp_profile_tools*.py' -v
+  python -m unittest discover -s backend/tests -p 'test_mcp_*.py' -v
 docker exec "$CONTAINER_NAME" python -m compileall -q backend
 
-echo "[5/6] Discovering the live MCP tools..."
+echo "[5/7] Verifying no-auth OAuth discovery and Streamable HTTP routing..."
+for discovery_path in \
+  '/.well-known/oauth-protected-resource' \
+  '/.well-known/oauth-protected-resource/mcp'; do
+  headers_file="$(mktemp)"
+  body_file="$(mktemp)"
+  status="$({ curl -sS \
+    -D "$headers_file" \
+    -o "$body_file" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:${HOST_PORT}${discovery_path}"; } || true)"
+  if [[ "$status" != "404" ]]; then
+    echo "Expected 404 for ${discovery_path}, got ${status}." >&2
+    cat "$headers_file" >&2 || true
+    cat "$body_file" >&2 || true
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+  if grep -qi '^content-type:.*text/html' "$headers_file"; then
+    echo "OAuth discovery ${discovery_path} incorrectly returned HTML." >&2
+    cat "$headers_file" >&2 || true
+    cat "$body_file" >&2 || true
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+  rm -f "$headers_file" "$body_file"
+done
+
+mcp_headers="$(mktemp)"
+mcp_body="$(mktemp)"
+mcp_status="$({ curl -sS \
+  -D "$mcp_headers" \
+  -o "$mcp_body" \
+  -w '%{http_code}' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'X-Voicebox-Client-Id: chatgpt' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"omv-probe","version":"1.0"}}}' \
+  "http://127.0.0.1:${HOST_PORT}/mcp"; } || true)"
+if [[ "$mcp_status" == "405" || "$mcp_status" == "404" || "$mcp_status" == "000" ]]; then
+  echo "POST /mcp did not reach FastMCP; HTTP status ${mcp_status}." >&2
+  cat "$mcp_headers" >&2 || true
+  cat "$mcp_body" >&2 || true
+  rm -f "$mcp_headers" "$mcp_body"
+  exit 1
+fi
+if grep -qi '^content-type:.*text/html' "$mcp_headers"; then
+  echo "POST /mcp was intercepted by the SPA and returned HTML." >&2
+  cat "$mcp_headers" >&2 || true
+  cat "$mcp_body" >&2 || true
+  rm -f "$mcp_headers" "$mcp_body"
+  exit 1
+fi
+printf 'POST /mcp reached FastMCP (HTTP %s).\n' "$mcp_status"
+rm -f "$mcp_headers" "$mcp_body"
+
+echo "[6/7] Discovering the live MCP tools..."
 docker exec -i "$CONTAINER_NAME" python - <<'PY'
 import asyncio
 from fastmcp import Client
@@ -88,7 +145,7 @@ async def main() -> None:
 asyncio.run(main())
 PY
 
-echo "[6/6] Running create -> sample -> get through the live MCP endpoint..."
+echo "[7/7] Running create -> sample -> get through the live MCP endpoint..."
 docker exec -i "$CONTAINER_NAME" python - <<'PY'
 import asyncio
 import base64
@@ -153,5 +210,5 @@ asyncio.run(main())
 PY
 
 echo
-echo "MCP profile-management verification completed successfully."
+echo "MCP profile-management and tunnel-routing verification completed successfully."
 echo "The test image remains available as: ${IMAGE_NAME}"
