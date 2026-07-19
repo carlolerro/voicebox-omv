@@ -7,8 +7,16 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter()
 
 
-@router.get("/.well-known/oauth-protected-resource")
-@router.get("/.well-known/oauth-protected-resource/{resource_path:path}")
+@router.api_route(
+    "/.well-known/oauth-protected-resource",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+@router.api_route(
+    "/.well-known/oauth-protected-resource/{resource_path:path}",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
 async def oauth_protected_resource_not_configured(
     resource_path: str | None = None,
 ) -> None:
