@@ -87,6 +87,20 @@ def _resolve_profile(profile: str, db: Session) -> DBVoiceProfile:
     return row
 
 
+def _reject_case_insensitive_duplicate(name: str, db: Session) -> None:
+    """Keep profile names unambiguous for case-insensitive MCP lookup."""
+    existing = (
+        db.query(DBVoiceProfile)
+        .filter(func.lower(DBVoiceProfile.name) == name.lower())
+        .first()
+    )
+    if existing is not None:
+        raise ValueError(
+            f"A profile with the name '{name}' already exists. "
+            "Please choose a different name."
+        )
+
+
 async def create_profile(
     *,
     name: str,
@@ -115,6 +129,8 @@ async def create_profile(
         preset_engine=preset_engine,
         preset_voice_id=preset_voice_id,
     )
+    _reject_case_insensitive_duplicate(request.name, db)
+
     created = await profiles_service.create_profile(request, db)
     row = db.query(DBVoiceProfile).filter_by(id=created.id).one()
     return serialize_profile(row, db)
@@ -128,6 +144,12 @@ async def get_profile(profile: str, db: Session) -> dict[str, Any]:
 def _sample_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     return suffix if suffix in ALLOWED_SAMPLE_SUFFIXES else ".wav"
+
+
+def _validate_sample_file_size(path: Path) -> None:
+    """Apply the same decoded-size ceiling to Base64 and Capture samples."""
+    if path.stat().st_size > MAX_PROFILE_SAMPLE_BYTES:
+        raise ValueError("Profile samples cannot exceed 50 MB.")
 
 
 @contextmanager
@@ -215,6 +237,7 @@ async def add_profile_sample(
         raise ValueError(
             f"Capture '{capture_id}' exists, but its audio file is unavailable."
         )
+    _validate_sample_file_size(path)
 
     explicit = (reference_text or "").strip()
     if explicit:
