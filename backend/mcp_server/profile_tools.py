@@ -61,8 +61,10 @@ def serialize_profile(profile: DBVoiceProfile, db: Session) -> dict[str, Any]:
                 ready = profile.preset_voice_id in voice_ids
             except ValueError:
                 ready = False
-    else:
+    elif voice_type == "cloned":
         ready = sample_count > 0
+    else:
+        ready = False
 
     return {
         "profile_id": profile.id,
