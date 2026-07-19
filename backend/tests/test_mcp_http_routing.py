@@ -42,9 +42,12 @@ class MCPHttpRoutingTestCase(unittest.TestCase):
             "/.well-known/oauth-protected-resource",
             "/.well-known/oauth-protected-resource/mcp",
         ):
-            response = client.get(path)
-            self.assertEqual(response.status_code, 404, path)
-            self.assertNotIn("text/html", response.headers.get("content-type", ""))
+            for method in (client.get, client.head):
+                response = method(path)
+                self.assertEqual(response.status_code, 404, f"{method.__name__} {path}")
+                self.assertNotIn(
+                    "text/html", response.headers.get("content-type", "")
+                )
 
     def test_normal_spa_routes_still_return_index_html(self) -> None:
         client = self._client()
