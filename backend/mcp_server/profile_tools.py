@@ -154,11 +154,19 @@ def _validate_sample_file_size(path: Path) -> None:
         raise ValueError("Profile samples cannot exceed 50 MB.")
 
 
+def _max_base64_chars() -> int:
+    """Maximum canonical Base64 length for the current decoded byte limit."""
+    return ((MAX_PROFILE_SAMPLE_BYTES + 2) // 3) * 4
+
+
 @contextmanager
 def decoded_audio_file(
     audio_base64: str, filename: str | None
 ) -> Iterator[Path]:
     """Decode strict Base64 into a bounded temporary audio file."""
+    if len(audio_base64) > _max_base64_chars():
+        raise ValueError("Profile samples cannot exceed 50 MB.")
+
     try:
         raw = b64.b64decode(audio_base64, validate=True)
     except Exception as exc:
