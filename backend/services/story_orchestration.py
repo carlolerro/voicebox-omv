@@ -41,6 +41,12 @@ ACTIVE_GENERATION_STATUSES = {"generating", "loading_model"}
 TERMINAL_GENERATION_STATUSES = {"completed", "failed"}
 POLL_INTERVAL_SECONDS = 0.5
 MAX_STORY_ERROR_CHARS = 500
+MAX_STORY_SEGMENTS = 100
+MAX_STORY_SEGMENT_CHARS = 10_000
+MAX_STORY_TOTAL_CHARS = 100_000
+MAX_STORY_TITLE_CHARS = 100
+MAX_STORY_DESCRIPTION_CHARS = 500
+MAX_STORY_PROFILE_REF_CHARS = 100
 
 _active_story_ids: set[str] = set()
 _story_tasks: dict[str, asyncio.Task] = {}
@@ -70,6 +76,10 @@ def resolve_story_profile(value: str, db: Session) -> DBVoiceProfile:
     candidate = (value or "").strip()
     if not candidate:
         raise ValueError("profile must not be empty")
+    if len(candidate) > MAX_STORY_PROFILE_REF_CHARS:
+        raise ValueError(
+            f"profile cannot exceed {MAX_STORY_PROFILE_REF_CHARS} characters"
+        )
 
     exact = (
         db.query(DBVoiceProfile)
@@ -118,7 +128,9 @@ def validate_story_profile(profile: DBVoiceProfile, db: Session) -> None:
         preset_engine = getattr(profile, "preset_engine", None)
         preset_voice_id = getattr(profile, "preset_voice_id", None)
         try:
-            valid_ids = preset_voices_service.get_preset_voice_ids(preset_engine or "")
+            valid_ids = preset_voices_service.get_preset_voice_ids(
+                preset_engine or ""
+            )
         except ValueError as exc:
             raise ValueError(
                 f"Voice profile '{profile.name}' is not ready for generation."
@@ -147,8 +159,16 @@ def _clean_segment_spec(segment: StorySegmentSpec) -> StorySegmentSpec:
     text = (segment.text or "").strip()
     if not profile:
         raise ValueError("profile must not be empty")
+    if len(profile) > MAX_STORY_PROFILE_REF_CHARS:
+        raise ValueError(
+            f"profile cannot exceed {MAX_STORY_PROFILE_REF_CHARS} characters"
+        )
     if not text:
         raise ValueError("Story segment text must not be empty")
+    if len(text) > MAX_STORY_SEGMENT_CHARS:
+        raise ValueError(
+            f"Story segment cannot exceed {MAX_STORY_SEGMENT_CHARS} characters"
+        )
     return StorySegmentSpec(profile=profile, text=text)
 
 
@@ -163,13 +183,37 @@ async def create_story_workflow(
     clean_title = (title or "").strip()
     if not clean_title:
         raise ValueError("Story title must not be empty")
+    if len(clean_title) > MAX_STORY_TITLE_CHARS:
+        raise ValueError(
+            f"Story title cannot exceed {MAX_STORY_TITLE_CHARS} characters"
+        )
     if not segments:
         raise ValueError("Story requires at least one segment")
+    if len(segments) > MAX_STORY_SEGMENTS:
+        raise ValueError(
+            f"Story cannot contain more than {MAX_STORY_SEGMENTS} segments"
+        )
 
     clean_description = (description or "").strip() or None
+    if (
+        clean_description
+        and len(clean_description) > MAX_STORY_DESCRIPTION_CHARS
+    ):
+        raise ValueError(
+            "Story description cannot exceed "
+            f"{MAX_STORY_DESCRIPTION_CHARS} characters"
+        )
+
     resolved: list[tuple[DBVoiceProfile, str]] = []
+    total_chars = 0
     for raw_segment in segments:
         segment = _clean_segment_spec(raw_segment)
+        total_chars += len(segment.text)
+        if total_chars > MAX_STORY_TOTAL_CHARS:
+            raise ValueError(
+                f"Story text cannot exceed {MAX_STORY_TOTAL_CHARS} "
+                "characters in total"
+            )
         profile = resolve_story_profile(segment.profile, db)
         validate_story_profile(profile, db)
         resolved.append((profile, segment.text))
@@ -211,9 +255,21 @@ def _safe_error(error: object) -> str:
     detail = getattr(error, "detail", None)
     text = str(detail if detail is not None else error)
     text = " ".join(text.split())
+    if "[SQL:" in text:
+        text = text.split("[SQL:", 1)[0].strip()
+    text = re.sub(
+        r"(?i)\b(token|secret|password|authorization|api[_-]?key)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        r"\1=<redacted>",
+        text,
+    )
     # Do not expose local Unix or Windows filesystem paths through MCP status.
     text = re.sub(r"/(?:[^/\s]+/)+[^\s,;]*", "<path>", text)
-    text = re.sub(r"[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])+[^\s,;]*", "<path>", text)
+    text = re.sub(
+        r"[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])+[^\s,;]*",
+        "<path>",
+        text,
+    )
     if not text:
         text = "Story processing failed"
     return text[:MAX_STORY_ERROR_CHARS]
@@ -252,6 +308,44 @@ def _recompute_progress(story: DBStory, db: Session) -> int:
     return completed
 
 
+def _validate_story_ready_for_render(story: DBStory, db: Session) -> None:
+    """Refuse to render an incomplete or structurally inconsistent script."""
+    segments = (
+        db.query(DBStorySegment)
+        .filter_by(story_id=story.id)
+        .order_by(DBStorySegment.position)
+        .all()
+    )
+    if len(segments) != story.total_segments:
+        raise ValueError(
+            "Story segment count does not match its persisted workflow state"
+        )
+    if not segments:
+        raise ValueError("Story has no segments")
+
+    generation_ids: set[str] = set()
+    for segment in segments:
+        if segment.status != "completed":
+            raise ValueError(
+                f"Story segment {segment.position} is not completed"
+            )
+        if not segment.generation_id:
+            raise ValueError(
+                f"Story segment {segment.position} has no generation"
+            )
+        if segment.generation_id in generation_ids:
+            raise ValueError("Multiple Story segments share one generation")
+        generation_ids.add(segment.generation_id)
+        if not _item_exists(db, story.id, segment.generation_id):
+            raise ValueError(
+                f"Story segment {segment.position} is not attached to the timeline"
+            )
+
+    completed = _recompute_progress(story, db)
+    if completed != story.total_segments:
+        raise ValueError("Story progress is incomplete")
+
+
 async def _attach_completed_generation(
     story_id: str,
     segment_id: str,
@@ -273,7 +367,9 @@ async def _attach_completed_generation(
                 db,
             )
             if item is None:
-                raise ValueError("Completed generation could not be attached to Story")
+                raise ValueError(
+                    "Completed generation could not be attached to Story"
+                )
 
         segment.status = "completed"
         segment.error = None
@@ -286,7 +382,9 @@ async def _attach_completed_generation(
 async def _wait_for_generation(generation_id: str) -> tuple[str, str | None]:
     while True:
         with _session_scope() as db:
-            generation = db.query(DBGeneration).filter_by(id=generation_id).first()
+            generation = db.query(DBGeneration).filter_by(
+                id=generation_id
+            ).first()
             if generation is None:
                 return "failed", "Generation record disappeared during processing"
             status = generation.status or "completed"
@@ -302,7 +400,9 @@ async def _prepare_generation(story_id: str, segment_id: str) -> str:
         if story is None or segment is None:
             raise ValueError("Story segment was not found")
 
-        profile = db.query(DBVoiceProfile).filter_by(id=segment.profile_id).first()
+        profile = db.query(DBVoiceProfile).filter_by(
+            id=segment.profile_id
+        ).first()
         if profile is None:
             raise ValueError("Story voice profile was deleted")
         validate_story_profile(profile, db)
@@ -332,8 +432,13 @@ async def _prepare_generation(story_id: str, segment_id: str) -> str:
             if status == "completed" or status in ACTIVE_GENERATION_STATUSES:
                 return generation.id
             if status == "failed":
-                result = await generation_routes.retry_generation(generation.id, db)
-                generation = db.query(DBGeneration).filter_by(id=generation.id).one()
+                result = await generation_routes.retry_generation(
+                    generation.id,
+                    db,
+                )
+                generation = db.query(DBGeneration).filter_by(
+                    id=generation.id
+                ).one()
                 generation.source = "mcp_story"
                 db.commit()
                 return _generation_id(result)
@@ -341,16 +446,19 @@ async def _prepare_generation(story_id: str, segment_id: str) -> str:
                 f"Generation {generation.id} has unsupported status '{status}'"
             )
 
+        personality_text = getattr(profile, "personality", None) or ""
         request = models.GenerationRequest(
             profile_id=profile.id,
             text=segment.text,
             language=profile.language or "en",
             engine=None,
-            personality=bool(getattr(profile, "personality", None)),
+            personality=bool(personality_text.strip()),
         )
         result = await generation_routes.generate_speech(request, db)
         generation_id = _generation_id(result)
-        generation = db.query(DBGeneration).filter_by(id=generation_id).first()
+        generation = db.query(DBGeneration).filter_by(
+            id=generation_id
+        ).first()
         if generation is None:
             raise ValueError("Generation service did not persist its result")
         generation.source = "mcp_story"
@@ -415,7 +523,10 @@ async def _process_segment(story_id: str, segment_id: str) -> bool:
             if generation_id
             else None
         )
-        if generation is not None and (generation.status or "completed") == "completed":
+        if (
+            generation is not None
+            and (generation.status or "completed") == "completed"
+        ):
             completed_generation_id = generation.id
         else:
             completed_generation_id = None
@@ -423,7 +534,9 @@ async def _process_segment(story_id: str, segment_id: str) -> bool:
     try:
         if completed_generation_id is not None:
             await _attach_completed_generation(
-                story_id, segment_id, completed_generation_id
+                story_id,
+                segment_id,
+                completed_generation_id,
             )
             return True
 
@@ -453,7 +566,10 @@ async def _run_story_workflow(story_id: str) -> None:
             story = db.query(DBStory).filter_by(id=story_id).first()
             if story is None:
                 return
-            if story.status == "completed" and story_rendering.resolve_valid_render_path(story):
+            if (
+                story.status == "completed"
+                and story_rendering.resolve_valid_render_path(story)
+            ):
                 return
             segment_ids = [
                 row.id
@@ -476,11 +592,11 @@ async def _run_story_workflow(story_id: str) -> None:
             story = db.query(DBStory).filter_by(id=story_id).first()
             if story is None:
                 return
+            _validate_story_ready_for_render(story, db)
             story.status = "rendering"
             story.error = None
             story.current_segment_index = None
             story.failed_segment_index = None
-            _recompute_progress(story, db)
             story.updated_at = datetime.utcnow()
             db.commit()
             try:
@@ -495,12 +611,13 @@ async def _run_story_workflow(story_id: str) -> None:
             story.error = None
             story.current_segment_index = None
             story.failed_segment_index = None
-            story.completed_segments = story.total_segments
+            _recompute_progress(story, db)
             story.updated_at = datetime.utcnow()
             db.commit()
     except asyncio.CancelledError:
         _mark_render_failure(
-            story_id, "Server was shut down during Story processing"
+            story_id,
+            "Server was shut down during Story processing",
         )
         raise
     except Exception as exc:
@@ -511,28 +628,42 @@ async def _run_story_workflow(story_id: str) -> None:
         _story_tasks.pop(story_id, None)
 
 
-def start_story_workflow(story_id: str) -> None:
-    """Start one local background coordinator without duplicating work."""
-    if story_id in _active_story_ids:
-        raise ValueError("Story is already processing")
-    _active_story_ids.add(story_id)
-    task = create_background_task(_run_story_workflow(story_id))
-    _story_tasks[story_id] = task
-
-
 def _consume_task_result(task: asyncio.Task) -> None:
     if task.cancelled():
         return
     try:
-        task.exception()
+        exception = task.exception()
+        if exception is not None:
+            logger.error("Story background task failed: %s", exception)
     except Exception:
         logger.exception("Could not inspect Story background task")
 
 
+def start_story_workflow(story_id: str) -> None:
+    """Start one local background coordinator without duplicating work."""
+    existing = _story_tasks.get(story_id)
+    if story_id in _active_story_ids or (
+        existing is not None and not existing.done()
+    ):
+        raise ValueError("Story is already processing")
+
+    _active_story_ids.add(story_id)
+    try:
+        task = create_background_task(_run_story_workflow(story_id))
+    except Exception:
+        _active_story_ids.discard(story_id)
+        raise
+    _story_tasks[story_id] = task
+    task.add_done_callback(_consume_task_result)
+
+
 def _install_task_callback(story_id: str) -> None:
+    """Compatibility helper; new starts install their callback automatically."""
     task = _story_tasks.get(story_id)
     if task is not None:
-        task.add_done_callback(_consume_task_result)
+        callbacks = getattr(task, "_callbacks", None) or []
+        if _consume_task_result not in callbacks:
+            task.add_done_callback(_consume_task_result)
 
 
 async def wait_for_story_workflow(story_id: str) -> None:
@@ -562,7 +693,10 @@ def is_story_resumable(story: DBStory, db: Session) -> bool:
         .scalar()
         or 0
     )
-    return completed < total or story_rendering.resolve_valid_render_path(story) is None
+    return (
+        completed < total
+        or story_rendering.resolve_valid_render_path(story) is None
+    )
 
 
 async def resume_story_workflow(story_id: str, db: Session) -> DBStory:
@@ -574,6 +708,8 @@ async def resume_story_workflow(story_id: str, db: Session) -> DBStory:
         raise ValueError("Story is already processing")
     if story.status != "failed":
         raise ValueError("Only failed Stories can be resumed")
+    if not is_story_resumable(story, db):
+        raise ValueError("Story has no incomplete work to resume")
 
     segments = (
         db.query(DBStorySegment)
@@ -585,18 +721,26 @@ async def resume_story_workflow(story_id: str, db: Session) -> DBStory:
         raise ValueError("Story has no segments to resume")
 
     for segment in segments:
-        profile = db.query(DBVoiceProfile).filter_by(id=segment.profile_id).first()
+        profile = db.query(DBVoiceProfile).filter_by(
+            id=segment.profile_id
+        ).first()
         if profile is None:
             raise ValueError("Story voice profile was deleted")
         validate_story_profile(profile, db)
 
-        if segment.generation_id and _item_exists(db, story_id, segment.generation_id):
+        if segment.generation_id and _item_exists(
+            db,
+            story_id,
+            segment.generation_id,
+        ):
             segment.status = "completed"
             segment.error = None
             continue
 
         generation = (
-            db.query(DBGeneration).filter_by(id=segment.generation_id).first()
+            db.query(DBGeneration).filter_by(
+                id=segment.generation_id
+            ).first()
             if segment.generation_id
             else None
         )
@@ -629,7 +773,6 @@ async def resume_story_workflow(story_id: str, db: Session) -> DBStory:
     db.refresh(story)
 
     start_story_workflow(story_id)
-    _install_task_callback(story_id)
     return story
 
 
@@ -643,6 +786,7 @@ def recover_interrupted_story_workflows(db: Session) -> int:
     if not stories:
         return 0
 
+    interrupted_error = "Server was shut down during Story processing"
     now = datetime.utcnow()
     for story in stories:
         segments = (
@@ -654,7 +798,9 @@ def recover_interrupted_story_workflows(db: Session) -> int:
         first_failed: int | None = None
         for segment in segments:
             if segment.generation_id and _item_exists(
-                db, story.id, segment.generation_id
+                db,
+                story.id,
+                segment.generation_id,
             ):
                 segment.status = "completed"
                 segment.error = None
@@ -667,26 +813,33 @@ def recover_interrupted_story_workflows(db: Session) -> int:
                 if segment.generation_id
                 else None
             )
-            if generation is not None and (
-                generation.status or "completed"
-            ) == "completed":
+            if (
+                generation is not None
+                and (generation.status or "completed") == "completed"
+            ):
                 # Resume will attach the already-completed generation.
                 segment.status = "pending"
                 segment.error = None
                 continue
 
-            if segment.status in {"generating", "rendering"} or (
+            generation_was_active = (
                 generation is not None
-                and (generation.status or "completed") in ACTIVE_GENERATION_STATUSES
-            ):
+                and (generation.status or "completed")
+                in ACTIVE_GENERATION_STATUSES
+            )
+            if generation_was_active:
+                generation.status = "failed"
+                generation.error = interrupted_error
+
+            if segment.status in {"generating", "rendering"} or generation_was_active:
                 segment.status = "failed"
-                segment.error = "Server was shut down during Story processing"
+                segment.error = interrupted_error
                 if first_failed is None:
                     first_failed = segment.position
             segment.updated_at = now
 
         story.status = "failed"
-        story.error = "Server was shut down during Story processing"
+        story.error = interrupted_error
         story.current_segment_index = None
         story.failed_segment_index = first_failed
         _recompute_progress(story, db)
