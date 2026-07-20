@@ -1,0 +1,125 @@
+"""Strict persistent rendering for MCP-created Stories.
+
+The existing Story mixer remains the single implementation of timeline mixing.
+This module adds a strict preflight and durable, atomic storage for workflows
+that must not silently omit failed or missing clips.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from datetime import datetime
+from pathlib import Path
+
+from sqlalchemy.orm import Session
+
+from .. import config
+from ..database import Generation as DBGeneration
+from ..database import GenerationVersion as DBGenerationVersion
+from ..database import Story as DBStory
+from ..database import StoryItem as DBStoryItem
+from ..utils.audio import load_audio
+from . import stories
+
+
+async def validate_render_inputs(story_id: str, db: Session) -> None:
+    """Require every Story item to reference completed, readable audio."""
+    story = db.query(DBStory).filter_by(id=story_id).first()
+    if story is None:
+        raise ValueError(f"Story '{story_id}' was not found")
+
+    items = (
+        db.query(DBStoryItem, DBGeneration)
+        .join(DBGeneration, DBStoryItem.generation_id == DBGeneration.id)
+        .filter(DBStoryItem.story_id == story_id)
+        .order_by(DBStoryItem.start_time_ms)
+        .all()
+    )
+    if not items:
+        raise ValueError("Story has no audio items")
+
+    for item, generation in items:
+        if generation.status != "completed":
+            raise ValueError(
+                f"Story segment generation is not completed: {generation.id}"
+            )
+
+        stored_path = generation.audio_path
+        if item.version_id:
+            version = (
+                db.query(DBGenerationVersion)
+                .filter_by(id=item.version_id, generation_id=generation.id)
+                .first()
+            )
+            if version is None:
+                raise ValueError(
+                    f"Story segment version is missing: {item.version_id}"
+                )
+            stored_path = version.audio_path
+
+        audio_path = config.resolve_storage_path(stored_path)
+        if audio_path is None or not audio_path.is_file():
+            raise ValueError(
+                f"Story segment audio is missing or unreadable: {generation.id}"
+            )
+
+        try:
+            await asyncio.to_thread(load_audio, str(audio_path), sample_rate=24_000)
+        except Exception as exc:
+            raise ValueError(
+                f"Story segment audio is missing or unreadable: {generation.id}"
+            ) from exc
+
+
+async def render_story_persistent(story_id: str, db: Session) -> str:
+    """Render a complete Story and atomically persist its final WAV.
+
+    Returns a storage-relative path suitable for the database and HTTP export.
+    """
+    await validate_render_inputs(story_id, db)
+
+    audio_bytes = await stories.export_story_audio(story_id, db)
+    if not audio_bytes:
+        raise ValueError("Story mixer produced no audio")
+
+    story = db.query(DBStory).filter_by(id=story_id).first()
+    if story is None:
+        raise ValueError(f"Story '{story_id}' was not found")
+
+    story_dir = config.get_stories_dir() / story_id
+    story_dir.mkdir(parents=True, exist_ok=True)
+    final_path = story_dir / "story.wav"
+    temporary_path = story_dir / "story.wav.tmp"
+
+    try:
+        with temporary_path.open("wb") as output:
+            output.write(audio_bytes)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, final_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    stored_path = config.to_storage_path(final_path)
+    story.render_audio_path = stored_path
+    story.rendered_at = datetime.utcnow()
+    story.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(story)
+    return stored_path
+
+
+def resolve_valid_render_path(story: DBStory) -> Path | None:
+    """Resolve a persisted render only when it still exists as a regular file."""
+    path = config.resolve_storage_path(story.render_audio_path)
+    return path if path is not None and path.is_file() else None
+
+
+def remove_persistent_render(story: DBStory) -> None:
+    """Remove a Story render and clear its in-memory render metadata."""
+    path = config.resolve_storage_path(story.render_audio_path)
+    if path is not None:
+        path.unlink(missing_ok=True)
+    story.render_audio_path = None
+    story.rendered_at = None
