@@ -119,6 +119,13 @@ def get_generations_dir() -> Path:
     return path
 
 
+def get_stories_dir() -> Path:
+    """Get persistent Story render directory."""
+    path = _data_dir / "stories"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def get_captures_dir() -> Path:
     """Get captures directory path."""
     path = _data_dir / "captures"
