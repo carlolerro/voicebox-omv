@@ -3,7 +3,7 @@
 **Date:** 2026-07-20  
 **Repository:** `carlolerro/voicebox-omv`  
 **Branch:** `feature/mcp-story-mode`  
-**Status:** Approved design, pending implementation plan
+**Status:** Approved design, pending user review and implementation plan
 
 ## 1. Goal
 
@@ -11,158 +11,179 @@ Expose Voicebox Story creation through MCP so an agent can submit an ordered scr
 
 The first release must:
 
-- accept an ordered list of segments containing only `profile` and `text`;
-- resolve language, engine, and personality from each profile;
-- start work asynchronously and return immediately with a `story_id`;
-- generate one normal Voicebox `Generation` per segment using the existing serial TTS queue;
+- accept ordered segments containing only `profile` and `text`;
+- derive language, engine, and personality behavior from the selected profile;
+- return immediately with a `story_id` and execute asynchronously;
+- create one normal persistent Voicebox `Generation` per segment through the existing serial TTS queue;
 - stop at the first failed segment;
-- preserve all previously completed generations and Story items;
-- allow an explicit resume from the failed segment;
-- render the final WAV automatically after the last segment completes;
-- persist the final WAV and expose it through an HTTP download URL;
-- remain compatible with the existing Story UI, REST endpoints, generation history, and audio-version model.
+- retain completed Generations, StoryItems, and audio;
+- resume explicitly from the failed segment without regenerating completed work;
+- render automatically after the final segment;
+- persist the final WAV and expose a same-origin HTTP download URL;
+- preserve existing Story UI, REST, history, versions, and single-clip MCP behavior.
 
-## 2. Non-goals for the first release
+## 2. Approved product decisions
 
-The first release will not include:
+The user approved these choices:
 
-- existing `generation_id` values as segment input;
-- imported or Base64 audio segments;
-- per-segment overrides for language, engine, personality, seed, instruction, effects, track, trim, volume, or timing;
+1. Story processing is asynchronous.
+2. The workflow stops at the first segment error.
+3. Completed work is retained and the Story is resumable.
+4. V1 segment input is only `profile + text`.
+5. Final rendering happens automatically.
+6. Language, engine, and personality behavior are inherited from the profile.
+7. The final WAV is delivered through an HTTP download URL, not Base64.
+
+## 3. Non-goals
+
+V1 does not include:
+
+- existing `generation_id` input;
+- uploaded, imported, local-path, or Base64 audio segments;
+- segment-level overrides for language, engine, personality, seed, instruct, effects, track, trim, volume, or timing;
 - parallel TTS inference;
 - Story cancellation through MCP;
-- Base64 delivery of the final WAV;
-- automatic continuation past a failed segment;
+- automatic continuation after failure;
 - deletion of completed work on failure;
 - a new frontend workflow;
-- a separate worker container or external job system;
-- GitHub Actions execution or workflow-trigger changes.
+- an external job system or worker container;
+- GitHub Actions execution or workflow changes.
 
-## 3. Existing backend capabilities
+## 4. Existing backend findings
 
-Voicebox already provides the core primitives:
+Voicebox already has the required low-level primitives:
 
-- `Story` stores name, description, and timestamps.
-- `StoryItem` links a completed `Generation` to a Story with timecode, track, trim, volume, and optional pinned version.
-- `/generate` creates a persistent Generation and enqueues TTS asynchronously.
-- the generation queue serializes inference to one job at a time.
-- Story services support item insertion, reordering, editing, and audio mixing.
-- `/stories/{story_id}/export-audio` exports a mixed WAV.
+- `Story` stores Story metadata.
+- `StoryItem` links a `Generation` to a Story with start time, track, trim, volume, and optional pinned version.
+- `/generate` creates a persistent Generation and enqueues asynchronous TTS.
+- `services.task_queue` serializes TTS inference to one job at a time.
+- Story services support item insertion, timeline editing, and audio mixing.
+- `/stories/{story_id}/export-audio` produces a mixed WAV.
 
-The missing component is a persistent orchestration layer that represents segments before they have a Generation, coordinates the existing queue, records progress, stops safely on failure, resumes idempotently, and persists the final mix.
+The missing component is a persistent orchestration layer representing segments before Generation creation and coordinating progress, failure, resume, and persistent final rendering.
 
-## 4. Chosen architecture
+## 5. Chosen architecture
 
 Add a persistent Story orchestration service above the existing generation and Story services.
 
-The architecture will have four layers:
+Layers:
 
-1. **MCP tools** validate tool-level input and normalize output.
+1. **MCP Story tools** validate input and normalize output.
 2. **Story orchestration service** owns workflow state and sequential progression.
-3. **Existing generation queue** performs all TTS inference, still one job at a time.
-4. **Existing Story mixer** assembles completed Story items and produces the final WAV.
+3. **Existing generation service and queue** perform all TTS work.
+4. **Existing Story timeline and mixer** assemble completed clips.
 
-The MCP layer must not call Voicebox over HTTP. It will call Python service functions directly, following the existing MCP implementation pattern.
+MCP tools call Python services directly; they do not call the Voicebox HTTP API.
 
-### 4.1 Main components
+### 5.1 Components
 
-Proposed focused modules:
+Create:
 
 - `backend/mcp_server/story_tools.py`
-  - MCP schemas and tool registration;
-  - profile/title/text validation;
-  - normalized tool responses;
-  - database-session lifecycle.
+  - four MCP tools;
+  - MCP input validation;
+  - normalized responses;
+  - short-lived database-session ownership.
 
 - `backend/services/story_orchestration.py`
-  - Story workflow creation;
-  - background task registration;
-  - segment progression;
-  - generation completion waiting;
-  - stop-on-error and resume behavior;
+  - transactional workflow creation;
+  - background-task registry;
+  - ordered segment processing;
+  - Generation terminal-state waiting;
+  - stop-on-error;
+  - resume and reconciliation;
   - restart recovery;
-  - final render transition.
+  - automatic final render.
 
-- existing `backend/services/stories.py`
-  - remains responsible for Story timeline operations and mixing;
-  - gains a reusable persistent-render function and render invalidation helpers.
+Modify focused existing boundaries:
 
-- existing generation route/service boundary
-  - the reusable logic currently embedded in `routes/generations.py::generate_speech` will be extracted into a service-level enqueue function;
-  - REST `/generate`, MCP `voicebox.speak`, and Story orchestration will use that same function;
-  - this avoids duplicating profile validation, engine resolution, personality rewriting, history creation, effects resolution, queue submission, and task-manager registration.
+- `backend/services/stories.py`
+  - reusable mixer;
+  - persistent render;
+  - render invalidation;
+  - active-workflow mutation guard.
 
-This is a targeted refactor only. TTS inference remains in `services/generation.py`, and queue mechanics remain in `services/task_queue.py`.
+- generation request boundary
+  - extract the reusable enqueue logic currently embedded in `routes/generations.py::generate_speech` into a service function;
+  - REST `/generate`, `voicebox.speak`, and Story orchestration use the same function;
+  - retain TTS inference in `services/generation.py` and queue mechanics in `services/task_queue.py`.
 
-## 5. Data model
+This refactor prevents duplication of engine resolution, profile validation, personality rewrite, history creation, effects resolution, task registration, and queue submission.
 
-### 5.1 Story extensions
+## 6. Data model
 
-Extend the existing `stories` table with idempotent startup migrations:
+### 6.1 Story extensions
 
-| Column | Type | Default | Purpose |
+Add these columns to `stories` through idempotent startup migrations:
+
+| Column | Type | Default | Meaning |
 |---|---|---:|---|
-| `status` | VARCHAR | `draft` | Workflow state |
-| `error` | TEXT nullable | null | Last workflow/render error |
-| `render_audio_path` | VARCHAR nullable | null | Storage-relative path to the persistent final WAV |
-| `rendered_at` | DATETIME nullable | null | Time of the last successful persistent render |
+| `status` | VARCHAR | `draft` | Story workflow state |
+| `error` | TEXT nullable | null | Last workflow or render error |
+| `render_audio_path` | VARCHAR nullable | null | Storage-relative final WAV path |
+| `rendered_at` | DATETIME nullable | null | Last successful persistent render |
 | `total_segments` | INTEGER | `0` | Number of orchestration segments |
-| `completed_segments` | INTEGER | `0` | Number successfully attached to the timeline |
-| `current_segment_index` | INTEGER nullable | null | One-based segment currently being processed |
-| `failed_segment_index` | INTEGER nullable | null | One-based segment that stopped the workflow |
+| `completed_segments` | INTEGER | `0` | Number of completed/attached segments |
+| `current_segment_index` | INTEGER nullable | null | One-based active segment |
+| `failed_segment_index` | INTEGER nullable | null | One-based segment that failed |
 
-Allowed `status` values:
+Allowed Story statuses:
 
-- `draft`: ordinary UI/REST Story or a Story manually changed after rendering;
-- `queued`: workflow accepted but not yet processing a segment;
-- `generating`: one segment is queued/running or being attached;
-- `rendering`: all segments completed and the final mix is being written;
-- `completed`: final persistent WAV is available;
-- `failed`: generation or render stopped the workflow and it may be resumable.
+- `draft`: normal UI/REST Story or manually edited Story;
+- `queued`: accepted and waiting for orchestration;
+- `generating`: a segment is being prepared, queued, generated, or attached;
+- `rendering`: all segments are complete and final WAV creation is active;
+- `completed`: persistent final WAV exists;
+- `failed`: generation, orchestration, shutdown, or render failure.
 
-No database-level enum is required because the project uses SQLite and string statuses elsewhere. Service validation will enforce the values.
+String validation remains in services; no database enum is introduced.
 
-### 5.2 New StorySegment table
+### 6.2 New `story_segments` table
 
-Add `story_segments`:
+| Column | Type | Constraint |
+|---|---|---|
+| `id` | VARCHAR | primary-key UUID |
+| `story_id` | VARCHAR | FK `stories.id`, not null |
+| `position` | INTEGER | one-based, not null |
+| `profile_id` | VARCHAR | FK `profiles.id`, not null |
+| `text` | TEXT | original submitted text, not null |
+| `generation_id` | VARCHAR nullable | FK `generations.id` |
+| `status` | VARCHAR | default `pending` |
+| `error` | TEXT nullable | segment error |
+| `created_at` | DATETIME | not null |
+| `updated_at` | DATETIME | not null |
 
-| Column | Type | Constraints | Purpose |
-|---|---|---|---|
-| `id` | VARCHAR | primary key UUID | Segment identity |
-| `story_id` | VARCHAR | FK `stories.id`, not null | Parent Story |
-| `position` | INTEGER | not null | One-based script order |
-| `profile_id` | VARCHAR | FK `profiles.id`, not null | Voice profile chosen at creation |
-| `text` | TEXT | not null | Submitted text before optional personality rewrite |
-| `generation_id` | VARCHAR nullable | FK `generations.id` | Persistent Generation created for the segment |
-| `status` | VARCHAR | default `pending` | Segment workflow state |
-| `error` | TEXT nullable | null | Segment-specific error |
-| `created_at` | DATETIME | not null | Creation time |
-| `updated_at` | DATETIME | not null | Last transition time |
+Constraints/indexes:
 
-Add a unique constraint on `(story_id, position)`.
+- unique `(story_id, position)`;
+- index `(story_id, status)`;
+- segment status is one of `pending`, `generating`, `completed`, `failed`.
 
-Allowed segment statuses:
+A completed segment must resolve to a completed Generation and an existing StoryItem. A failed segment may retain its failed Generation.
 
-- `pending`;
-- `generating`;
-- `completed`;
-- `failed`.
+### 6.3 Generation source
 
-A completed segment must have a completed Generation and an associated StoryItem. A failed segment may retain a failed Generation so resume can retry the same logical generation instead of creating duplicates.
-
-### 5.3 Generation source
-
-Story-created generations use:
+Story-created Generations use:
 
 ```text
 source = "mcp_story"
 ```
 
-No schema change is needed because `Generation.source` is already a string.
+No Generation schema change is required.
 
-## 6. MCP contract
+### 6.4 Deletion semantics
 
-Register four new tools:
+Deleting a terminal/draft Story:
+
+- deletes its `story_segments` and `story_items`;
+- deletes its persisted final Story WAV and directory best-effort;
+- preserves underlying Generation history, versions, and generation audio, matching current Story deletion semantics.
+
+Deleting a Story in `queued`, `generating`, or `rendering` is rejected with HTTP `409`.
+
+## 7. MCP contract
+
+Register:
 
 ```text
 voicebox.create_story
@@ -171,9 +192,9 @@ voicebox.get_story
 voicebox.resume_story
 ```
 
-The FastMCP server instructions will mention Story creation, status polling, resume, and the final download URL.
+Story lookup is by ID only because titles are not unique.
 
-### 6.1 `voicebox.create_story`
+### 7.1 `voicebox.create_story`
 
 Input:
 
@@ -182,41 +203,35 @@ Input:
   "title": "Capitolo 17 - Come lavora Spark",
   "description": "Dialogo introduttivo",
   "segments": [
-    {
-      "profile": "serena",
-      "text": "Benvenuti..."
-    },
-    {
-      "profile": "ryan",
-      "text": "Partiamo dall'inizio..."
-    }
+    {"profile": "serena", "text": "Benvenuti..."},
+    {"profile": "ryan", "text": "Partiamo dall'inizio..."}
   ]
 }
 ```
 
-Validation:
+`title` maps to the existing `Story.name` field.
 
-- `title`: 1–100 characters after trimming;
-- `description`: optional, maximum 500 characters;
-- `segments`: 1–100 entries;
-- each `text`: 1–10,000 characters after trimming;
-- combined segment text: maximum 100,000 characters;
-- `profile`: non-empty profile name or exact profile ID;
-- profile-name lookup is case-insensitive and must resolve unambiguously;
-- all profiles must exist and be ready for generation before any Story row is created;
-- only `preset` and ready `cloned` profiles are accepted;
-- legacy or unsupported profile types are rejected;
-- duplicate profiles across different segments are allowed;
-- duplicate text is allowed.
+Validation before persistence:
 
-Profile-derived settings for every segment:
+- title: 1–100 trimmed characters;
+- description: optional, maximum 500 characters;
+- segments: 1–100;
+- each text: 1–10,000 trimmed characters;
+- total submitted text: maximum 100,000 characters;
+- profile: exact ID or case-insensitive unambiguous name;
+- every profile exists and is generation-ready;
+- accepted types: valid preset or ready cloned profile;
+- rejected types: designed, legacy unsupported, invalid preset, or cloned without samples;
+- duplicate profiles and duplicate text are permitted.
 
-- `language = profile.language`;
-- `engine = profile.default_engine`, then `profile.preset_engine`, then the existing backend fallback;
-- personality rewriting is enabled when `profile.personality` is non-empty;
-- all other generation parameters use existing Voicebox defaults.
+Profile-derived generation settings:
 
-Creation is transactional: validation completes first, then the Story and all StorySegment rows are committed together. A background orchestration task is started only after a successful commit.
+- language is `profile.language`;
+- engine resolution is `profile.default_engine`, then `profile.preset_engine`, then the current backend fallback;
+- personality rewrite is enabled exactly when `profile.personality` is non-empty;
+- other parameters use current Voicebox generation defaults.
+
+All profiles are validated first. Story and StorySegment rows are then created in one transaction. The background task starts only after commit.
 
 Immediate response:
 
@@ -229,25 +244,22 @@ Immediate response:
   "completed_segments": 0,
   "current_segment": null,
   "failed_segment": null,
+  "error": null,
   "resumable": false,
   "download_url": null,
   "status_tool": "voicebox.get_story_status"
 }
 ```
 
-### 6.2 `voicebox.get_story_status`
+### 7.2 `voicebox.get_story_status`
 
 Input:
 
 ```json
-{
-  "story_id": "uuid"
-}
+{"story_id": "uuid"}
 ```
 
-Story lookup is by ID only because Story titles are not unique.
-
-Response while generating:
+Response shape:
 
 ```json
 {
@@ -264,7 +276,7 @@ Response while generating:
 }
 ```
 
-Response after failure:
+Failure example:
 
 ```json
 {
@@ -281,7 +293,7 @@ Response after failure:
 }
 ```
 
-Response after completion:
+Completion example:
 
 ```json
 {
@@ -298,19 +310,19 @@ Response after completion:
 }
 ```
 
-`download_url` is a same-origin HTTP path. It is returned only when a valid persistent render exists.
+`download_url` is a same-origin path and is present only when the persistent WAV exists.
 
-### 6.3 `voicebox.get_story`
+`resumable` is true when the Story is failed and either an incomplete segment exists or all segments are completed but rendering failed. Current profile readiness is rechecked by `resume_story`.
+
+### 7.3 `voicebox.get_story`
 
 Input:
 
 ```json
-{
-  "story_id": "uuid"
-}
+{"story_id": "uuid"}
 ```
 
-Response includes the normalized Story status plus ordered segment details:
+Return the normalized Story status plus ordered segments:
 
 ```json
 {
@@ -346,332 +358,346 @@ Response includes the normalized Story status plus ordered segment details:
 }
 ```
 
-The response will not expose local filesystem paths.
+Do not expose local filesystem paths, stack traces, or internal exception representations.
 
-### 6.4 `voicebox.resume_story`
+### 7.4 `voicebox.resume_story`
 
 Input:
 
 ```json
-{
-  "story_id": "uuid"
-}
+{"story_id": "uuid"}
 ```
 
 Rules:
 
-- only a Story in `failed` state with at least one incomplete segment can resume;
-- all remaining profiles are revalidated before changing the Story state;
-- a missing or no-longer-ready profile rejects the call without discarding completed work;
-- concurrent resume attempts for the same Story are rejected;
-- a failed existing Generation is retried using the same logical Generation when possible;
-- a segment with no Generation receives a new Generation;
-- a completed Generation missing its StoryItem is attached idempotently rather than regenerated;
+- only a failed, resumable Story is accepted;
+- all remaining profiles are revalidated before changing state;
+- concurrent orchestration/resume for the same Story is rejected;
 - completed segments are never regenerated;
-- the Story returns to `queued`, clears Story-level error fields, and starts a new background orchestration task;
-- the tool returns immediately with the same normalized status shape as `create_story`.
+- when `generation_id` exists and that Generation is `failed`, reset and retry that same Generation ID through the shared retry service;
+- when `generation_id` is absent or its row no longer exists, create one new Generation and store its ID;
+- when the Generation is completed but StoryItem is absent, attach it idempotently;
+- when StoryItem exists but segment state is not completed, reconcile the segment to completed;
+- when all segments are completed and only rendering failed, retry rendering without TTS;
+- set Story to `queued`, clear workflow error/current/failed fields as appropriate, commit, then start the background task;
+- return immediately with the normalized status response.
 
-## 7. Workflow and state transitions
+A missing or no-longer-ready remaining profile rejects resume without changing completed work or Story state.
 
-### 7.1 Normal execution
+## 8. Workflow
+
+### 8.1 Normal progression
 
 ```text
-Story queued
-  -> Story generating / segment 1 generating
-  -> segment 1 completed + StoryItem attached
-  -> Story completed_segments incremented
-  -> next pending segment
-  -> ...
-  -> Story rendering
-  -> persistent WAV written atomically
-  -> Story completed
+queued
+  -> generating segment 1
+  -> Generation completed
+  -> StoryItem attached
+  -> segment completed, progress incremented
+  -> next segment
+  -> rendering
+  -> atomic persistent WAV write
+  -> completed
 ```
 
-For each segment:
+Per segment:
 
-1. Open a short-lived database session.
-2. Re-read Story and segment state.
-3. Resolve the current profile by stored `profile_id`.
-4. Enqueue a normal Generation through the shared generation service.
-5. Persist `generation_id` and segment `generating` state.
-6. Wait asynchronously for the Generation to reach `completed` or `failed`.
-7. On completion, call existing Story insertion logic with track `0` and no explicit start time.
-8. Existing insertion behavior places the clip after the previous clip with a fixed 200 ms gap.
-9. Mark the segment completed and update Story progress in one transaction.
-10. Continue to the next segment.
+1. Open a short-lived DB session and re-read Story/segment.
+2. Revalidate stored profile ID.
+3. Enqueue a normal Generation through the shared generation service.
+4. Store `generation_id`; mark Story/segment generating.
+5. Close the write session.
+6. Wait asynchronously for Generation terminal state using repeated short-lived read sessions.
+7. On completion, call existing Story insertion with track `0` and no explicit start time.
+8. Existing insertion places the clip after prior audio with a fixed 200 ms gap.
+9. Mark segment completed and update/reconcile Story progress in one transaction.
+10. Continue.
 
-Database sessions must not remain open while TTS inference runs. The waiter re-reads status with short-lived sessions to avoid stale ORM state and long SQLite write locks.
+No DB session remains open during inference or polling sleeps.
 
-### 7.2 Failure
+### 8.2 First-error stop
 
-At the first failed Generation or orchestration error:
+At the first Generation/orchestration failure:
 
-- copy the error to the segment;
-- set segment status to `failed`;
-- set Story status to `failed`;
+- set the segment to `failed` and persist its sanitized error;
+- set Story to `failed`;
 - set `failed_segment_index`;
 - clear `current_segment_index`;
-- preserve all completed Generations, versions, audio files, StoryItems, and segment records;
-- do not process later segments;
-- do not render a partial final file;
-- leave `render_audio_path` null or remove any stale render reference.
+- stop before any later segment;
+- retain all completed Generation rows, versions, files, StoryItems, and segment rows;
+- do not produce a partial final render;
+- clear/remove stale render metadata if present;
+- perform no automatic retry.
 
-No automatic retry is performed.
+### 8.3 Render failure
 
-### 7.3 Rendering failure
+When generation is complete but rendering fails:
 
-If all segments complete but rendering fails:
+- all segments stay completed;
+- Story becomes failed;
+- `failed_segment_index` remains null;
+- Story error contains the sanitized render error;
+- resume performs render only.
 
-- keep every segment completed;
-- set Story status to `failed`;
-- leave `failed_segment_index` null;
-- record the render error;
-- `resume_story` skips generation work and retries rendering only.
+### 8.4 Restart recovery
 
-### 7.4 Restart recovery
+During startup, after existing stale-Generation cleanup:
 
-At application startup, after the existing stale-Generation cleanup:
-
-- Stories in `queued`, `generating`, or `rendering` are set to `failed`;
-- the Story error becomes `Server was shut down during Story processing`;
-- a currently active segment becomes `failed` unless its Generation is already completed;
+- Stories in `queued`, `generating`, or `rendering` become `failed`;
+- error becomes `Server was shut down during Story processing`;
+- an active segment becomes failed unless its Generation is completed;
 - completed segments remain completed;
-- `completed_segments` is recomputed from persisted segment state;
-- no Story is resumed automatically;
-- the user or MCP client must call `voicebox.resume_story`.
+- `completed_segments` is recomputed from segment/StoryItem state;
+- no automatic resume occurs.
 
-This makes recovery explicit and prevents duplicate generations after container restarts.
+Explicit resume prevents duplicate Generations after container restart.
 
-## 8. Concurrency and idempotency
+## 9. Concurrency and idempotency
 
-Voicebox currently runs a single application process and serial TTS queue. Story orchestration will preserve that model.
+Use an in-process active-Story registry because the deployment is one Voicebox process. Persistent Story status remains authoritative after restart.
 
-Use an in-process registry of active `story_id` values to prevent duplicate orchestration tasks in the same process. Persistent status validation remains authoritative across restarts.
+Required idempotency:
 
-Idempotency requirements:
+- Story and segments are created once transactionally;
+- each segment owns at most one current logical Generation ID;
+- existing `add_item_to_story` idempotency is preserved;
+- completed Generation without StoryItem is attached, not regenerated;
+- existing StoryItem with stale segment status is reconciled;
+- `completed_segments` is recomputed when consistency is uncertain;
+- persistent render writes a temporary file and atomically replaces `story.wav`;
+- active-registry cleanup occurs in `finally` on success, failure, and cancellation.
 
-- Story/segment creation occurs once in a transaction;
-- a segment may reference only one logical Generation;
-- adding a Generation to a Story remains idempotent through existing `add_item_to_story` behavior;
-- resuming after `Generation completed` but before StoryItem creation attaches the existing Generation;
-- resuming after StoryItem creation but before segment completion detects the existing item and marks the segment completed;
-- final render writes to a temporary file in the Story directory and uses atomic replacement for `story.wav`;
-- `completed_segments` is derived/reconciled from segment states rather than trusted blindly after recovery.
+Multiple Story orchestrators may wait concurrently, but every TTS job still enters the existing global serial queue. No parallel inference is introduced.
 
-No parallel segment generation will be added. Multiple Story workflows may be queued as background orchestrators, but every actual TTS Generation still passes through the global serial queue.
+## 10. Persistent render and HTTP download
 
-## 9. Persistent render and HTTP download
-
-Create a Story storage directory through config helpers:
+Use config helpers to store:
 
 ```text
 /app/data/stories/{story_id}/story.wav
 ```
 
-Persist `render_audio_path` using Voicebox storage-relative path helpers, never an absolute host path.
+The database stores a storage-relative path.
 
-Refactor the current Story export implementation into reusable mixing and output functions:
+Refactor current export into:
 
-- a mixer that resolves Generation versions, loads audio, applies trim and per-clip volume, places clips on the timeline, mixes overlaps, and normalizes clipping;
-- a persistent renderer that writes the mixed audio to a temporary WAV and atomically replaces `story.wav`;
-- the existing byte-export compatibility path for legacy/UI Stories.
+- reusable mix function: resolve pinned/default versions, load, trim, apply volume, place on timeline, sum overlaps, normalize clipping;
+- persistent render function: write temporary WAV in the Story directory and atomically replace `story.wav`;
+- existing on-demand byte export for legacy/draft Stories.
 
-`GET /stories/{story_id}/export-audio` behavior:
+`GET /stories/{story_id}/export-audio`:
 
-1. If `render_audio_path` points to an existing valid file, return it with `FileResponse`.
-2. Otherwise preserve existing behavior by mixing the current timeline on demand and streaming a WAV.
-3. Use a sanitized Story title for the download filename.
-4. Return `404` when the Story does not exist.
-5. Return `400` when the Story has no renderable audio items.
+1. `404` when Story is absent.
+2. Serve valid `render_audio_path` with `FileResponse` when present.
+3. Otherwise preserve current on-demand mixing/streaming.
+4. `400` when no renderable audio exists.
+5. Use sanitized Story title as the download filename.
 
-This preserves existing REST/UI behavior while making MCP-generated completed Stories efficient and downloadable.
+## 11. Existing Story mutation behavior
 
-## 10. Interaction with existing Story mutations
+For `queued`, `generating`, or `rendering` Stories, every mutation returns HTTP `409`, including:
 
-An active MCP workflow must not be manually changed underneath the orchestrator.
+- title/description update;
+- item add/remove/reorder/move/trim/split/duplicate/version/volume;
+- Story deletion.
 
-For Stories in `queued`, `generating`, or `rendering`:
+For draft/completed/failed Stories, existing operations remain available subject to normal validation.
 
-- Story item add/remove/reorder/move/trim/split/duplicate/version/volume operations return HTTP `409`;
-- Story deletion returns HTTP `409`;
-- Story title/description updates may also return `409` for a consistent first release.
+A successful timeline mutation after a persistent render:
 
-For terminal or draft Stories, existing operations remain available.
+- clears `render_audio_path` and `rendered_at`;
+- removes the stale rendered file best-effort;
+- changes completed Story status to `draft`;
+- retains failed status when an unresolved orchestration failure still exists.
 
-Any successful timeline mutation on a Story with a persistent render must:
+On-demand export continues to work for the edited draft.
 
-- clear `render_audio_path` and `rendered_at`;
-- remove the obsolete persisted file best-effort;
-- set status to `draft` unless the Story is currently `failed` for an unresolved orchestration error.
+## 12. Profile semantics
 
-The existing on-demand export route still allows the edited draft to be downloaded.
+Profiles are validated before Story creation, before each segment, and before resume.
 
-## 11. Profile and generation semantics
+Accepted:
 
-Before Story creation, all profiles are validated up front. Before each segment and resume, the profile is checked again because profiles can be edited or deleted after the initial request.
+- preset profile with valid preset engine and voice ID;
+- cloned profile with supported cloning engine and at least one valid sample.
 
-A profile is accepted when:
+Rejected:
 
-- preset profile: valid preset engine and voice ID, immediately ready;
-- cloned profile: supported cloning engine and at least one valid sample;
-- designed/legacy/unsupported profile: rejected for this release.
+- designed profile;
+- unsupported/legacy type;
+- invalid preset;
+- cloned profile without a sample.
 
-The Story orchestrator uses the same engine validation and model-cache errors as normal `/generate` and `voicebox.speak`.
+Personality behavior:
 
-Personality behavior is deterministic:
+- non-empty profile personality enables rewrite;
+- empty personality sends submitted text directly to TTS;
+- `story_segments.text` retains original text;
+- Generation text stores the rewritten text actually sent to TTS, matching existing behavior.
 
-- when the profile has a non-empty personality prompt, Story generation requests personality rewriting;
-- otherwise text is sent directly to TTS;
-- the original submitted segment text remains in `story_segments.text`;
-- the Generation row stores the actual text sent to TTS after rewriting, matching existing Generation behavior.
+## 13. Error and security contract
 
-## 12. Error contract
+Tool validation errors occur before Story creation where applicable.
 
-Tool validation errors raise a clear MCP tool error before any Story is created.
+Runtime errors are persisted and observed through status tools; the original create/resume MCP call does not remain open.
 
-Examples:
+Sanitized errors must not expose:
 
-- ambiguous/missing profile;
-- profile not ready;
-- unsupported profile type;
-- empty title or segment text;
-- segment or total-size limit exceeded;
-- Story not found;
-- Story not resumable;
-- another workflow already active for the Story.
+- host paths;
+- stack traces;
+- secrets;
+- raw exception repr containing internal data.
 
-Runtime TTS and render failures are persisted in Story/segment status and returned by status tools. They do not keep the original MCP call open.
+Security/resource rules:
 
-Error messages must not expose host filesystem paths, stack traces, secrets, or raw internal exception representations containing sensitive data.
-
-## 13. Security and resource limits
-
-- No arbitrary local file paths are accepted by Story tools.
-- No Base64 audio is accepted.
-- No direct SQL or storage path is accepted.
-- Text limits are enforced before database writes.
-- The existing global serial queue prevents concurrent model inference and resource contention.
-- Final audio is served only through a Story-ID route that verifies the Story and its stored path.
-- Storage paths are resolved through existing safe config helpers.
-- File writes use a Story UUID directory and fixed filename to avoid path traversal.
-
-The deployment retains the current no-auth local/tunnel MCP model and `X-Voicebox-Client-Id` behavior. This feature does not redefine authentication.
+- no local paths, Base64, SQL, storage paths, or arbitrary files in Story input;
+- limits enforced before writes;
+- Story-ID download route verifies Story and safely resolves stored path;
+- UUID directory plus fixed filename prevents path traversal;
+- existing serial queue bounds inference concurrency;
+- current local/tunnel no-auth and `X-Voicebox-Client-Id` behavior is unchanged.
 
 ## 14. Registration and documentation
 
-`backend/mcp_server/server.py` will register `register_story_tools(mcp)` after existing base/profile tools.
+`backend/mcp_server/server.py` registers `register_story_tools(mcp)` after existing tools.
 
 Update:
 
-- FastMCP server instructions;
-- MCP documentation page;
-- tool examples for create, poll, failure, resume, and download;
-- tool count in OMV verification scripts;
-- production verification expectations.
+- FastMCP instructions;
+- MCP documentation;
+- examples for create, polling, failure, resume, and download;
+- OMV verification expected tool count from 8 to 12;
+- production deployment verification documentation.
 
-No GitHub Actions workflow will be added or automatically enabled. Verification remains local and on the OMV host.
+Do not add, enable, or modify GitHub Actions. Verification remains local/OMV.
 
 ## 15. Testing strategy
 
-Implementation follows test-driven development.
+Implementation follows TDD.
 
-### 15.1 Model and migration tests
+### 15.1 Migration/model tests
 
-- fresh database creates Story orchestration columns and `story_segments`;
-- upgrade migration is idempotent;
-- existing Story rows receive `draft` and zero progress defaults;
+- fresh DB contains new Story columns/table/indexes;
+- migration is idempotent;
+- existing Stories become draft with zero counters;
+- existing Story/StoryItem data remains intact;
 - unique `(story_id, position)` is enforced;
-- migration preserves existing Story and StoryItem data.
+- terminal deletion removes segments/render but preserves Generations.
 
-### 15.2 MCP contract tests
+### 15.2 MCP tests
 
-- all four Story tools are registered;
-- create accepts valid `profile + text` segments;
-- all profiles are validated before persistence;
-- profile names resolve case-insensitively and ambiguities fail;
-- input limits are enforced;
-- no local paths appear in responses;
-- completed status returns the expected same-origin download URL;
-- get and status require Story ID;
-- resume rejects non-failed and already-active Stories.
+- four tools registered;
+- valid create response is immediate and queued;
+- all profiles validated before persistence;
+- case-insensitive/ambiguous resolution;
+- all limits;
+- no local paths in output;
+- exact status/get/resume shapes;
+- URL only when persistent render exists;
+- resume state/concurrency validation.
 
 ### 15.3 Orchestration tests
 
-Use a controlled fake generation runner; unit tests must not require GPU/model downloads.
+Use a deterministic fake generation runner that writes small synthetic WAVs; unit/integration tests require no GPU or model downloads.
 
-- normal two-profile Story progresses in order;
-- each segment creates one persistent Generation with source `mcp_story`;
-- language, engine, and personality derive from the profile;
-- StoryItems receive sequential timecodes with 200 ms gaps;
-- first generation failure stops later segments;
-- completed work survives failure;
-- resume retries the failed segment and does not regenerate completed segments;
-- completed Generation without StoryItem is attached on resume;
-- existing StoryItem with incomplete segment state is reconciled;
-- render failure leaves all segments completed and resume retries only render;
-- duplicate resume is rejected;
-- restart recovery marks active workflows failed and resumable;
-- database sessions are closed on success and failure.
+- two-profile ordered success;
+- one Generation per segment with source `mcp_story`;
+- profile-derived language/engine/personality;
+- 200 ms sequential gaps;
+- first failure stops later segments;
+- completed work survives;
+- resume retries same failed Generation ID;
+- missing Generation row creates exactly one replacement;
+- completed Generation without item is attached;
+- existing item/stale state is reconciled;
+- render-only resume;
+- duplicate resume rejected;
+- startup recovery;
+- active-registry cleanup;
+- DB session closure.
 
-### 15.4 Mixer/download tests
+### 15.4 Mixer/HTTP tests
 
-- persistent render contains the ordered clips;
-- trim, volume, pinned versions, overlaps, and normalization retain existing behavior;
-- render uses atomic replacement;
-- persisted render is served with `FileResponse`;
-- legacy/draft Story falls back to on-demand export;
-- missing Story returns `404`;
-- Story with no audio returns `400`;
-- manual timeline mutation invalidates a stale persistent render.
+- ordered mix;
+- existing trim, volume, versions, overlap, and normalization behavior;
+- atomic render replacement;
+- persisted `FileResponse` path;
+- legacy/draft fallback;
+- `404`, `400`, and `409` behavior;
+- mutation invalidates render.
 
-### 15.5 HTTP and lifecycle tests
+### 15.5 Regression tests
 
-- active Story mutations and deletion return `409`;
-- startup recovery runs after stale Generation cleanup;
-- exact `/mcp` routing remains functional;
-- OAuth discovery behavior remains non-HTML JSON `404`;
-- existing eight MCP tools remain unchanged.
+- original eight MCP tools remain unchanged;
+- exact `/mcp` POST remains `200`;
+- OAuth discovery remains non-HTML JSON `404`;
+- existing Story UI/REST tests pass;
+- existing generation queue remains serial.
 
-### 15.6 OMV verification
+## 16. OMV verification
 
-Extend the existing OMV verification script to:
+The OMV verification has two explicit layers.
 
-- build the current Dockerfile locally;
-- run all non-GPU MCP Story tests;
-- discover the original eight tools plus the four new Story tools;
-- create a short Story using a controlled test path or available lightweight preset;
-- poll until terminal state;
-- verify ordered segment records;
-- verify the final WAV route returns `200` and `audio/wav`;
-- exercise a forced failure and resume scenario without deleting completed work.
+### 16.1 Deterministic non-GPU verification
 
-Production deployment must retain the existing persistent `/app/data` volume and rollback process.
+Inside the built isolated container:
 
-## 16. Compatibility and rollout
+- run all MCP Story unit/integration tests;
+- integration test uses the fake generation runner and synthetic WAVs in the isolated data volume;
+- verify create → poll → completed → HTTP WAV download;
+- verify forced segment failure → stopped later work → resume → completion;
+- discover all 12 MCP tools through the live FastMCP endpoint.
 
-- Existing Stories become `draft`; no existing timeline data is changed.
-- Existing Story REST routes continue to work.
-- Existing `/stories/{id}/export-audio` remains compatible.
-- Existing `voicebox.speak` remains the single-clip generation tool.
-- Existing generation history and versions remain the source of segment audio.
-- Existing global generation serialization remains unchanged.
-- No frontend changes are required for MCP Story creation; generated Stories appear through existing Story queries and timeline data.
-- The feature is developed and verified on `feature/mcp-story-mode` before any update to `main`.
-- OMV production deployment uses the feature branch until explicit production verification and approval.
+### 16.2 Real-model production smoke test
 
-## 17. Acceptance criteria
+The production verification script accepts two required environment variables:
 
-The feature is accepted when all of the following are demonstrated with fresh evidence:
+```text
+VERIFY_STORY_PROFILE_A=<ready profile name or id>
+VERIFY_STORY_PROFILE_B=<different ready profile name or id>
+```
 
-1. `voicebox.create_story` returns within the MCP request window with `status=queued`.
-2. A Story with at least two different profiles generates segments serially in input order.
-3. Each segment is visible as a normal Generation and StoryItem.
-4. `voicebox.get_story_status` reports accurate progress throughout the workflow.
-5. The first failed segment stops processing and leaves prior segments intact.
-6. `voicebox.resume_story` continues from the failed segment without regenerating completed work.
-7. Completion automatically creates a persistent mixed WAV.
-8. Status returns `/stories/{story_id}/export-audio` only when that WAV exists.
-9. The download route serves the final WAV successfully.
-10. Restart recovery leaves interrupted work in an explicit failed/resumable state.
-11. Existing Story UI/REST behavior and the original eight MCP tools pass regression tests.
-12. The Docker image builds and the full non-GPU verification suite passes on OMV without GitHub Actions.
+With both supplied, it:
+
+1. creates a two-segment Story with short fixed Italian phrases;
+2. polls `voicebox.get_story_status` until completed or failed;
+3. fails verification on timeout or failed status;
+4. verifies two completed segment records in input order;
+5. verifies the two configured profile references;
+6. downloads `/stories/{story_id}/export-audio`;
+7. verifies HTTP `200`, `audio/wav`, and a non-empty valid WAV header.
+
+Production acceptance requires this real-model smoke test. The deterministic forced-failure/resume test remains isolated and does not deliberately break production models.
+
+Deployment retains `/app/data`, the transactional OMV deployment process, and rollback image.
+
+## 17. Compatibility and rollout
+
+- Existing Stories become draft without timeline changes.
+- Existing REST Story routes and export remain compatible.
+- Existing `voicebox.speak` remains the single-clip tool.
+- Story segments remain normal Generation history entries.
+- No frontend change is required; generated StoryItems are visible through current Story data.
+- Development and verification occur on `feature/mcp-story-mode`.
+- OMV uses the feature branch until production verification and explicit approval.
+- Only after verification is the branch fast-forwarded/merged to `main`.
+
+## 18. Acceptance criteria
+
+Fresh evidence must demonstrate:
+
+1. `create_story` returns immediately with queued status.
+2. Two distinct ready profiles generate serially in input order.
+3. Every segment becomes a normal Generation and StoryItem.
+4. Status progress is accurate.
+5. First failure stops later segments and preserves prior work.
+6. Resume continues from failure without regenerating completed work.
+7. Restart leaves an explicit failed/resumable state.
+8. Completion automatically persists a mixed WAV.
+9. Download URL appears only for an existing render.
+10. HTTP download returns a valid WAV.
+11. Active Story mutations return `409`.
+12. Existing Story behavior and original eight MCP tools pass regression tests.
+13. Docker build and deterministic non-GPU tests pass on OMV.
+14. The real-model two-profile OMV smoke test passes.
+15. No GitHub Actions are run or modified.
