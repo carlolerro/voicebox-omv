@@ -12,10 +12,15 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # Profile services import cache helpers whose production implementation depends
-# on torch. These tests exercise metadata only.
+# on torch. These tests exercise metadata only. Keep the stub API-complete
+# because the focused aggregate suite may later import the full FastAPI app.
 _cache_stub = ModuleType("backend.utils.cache")
 _cache_stub._get_cache_dir = lambda: Path(tempfile.gettempdir()) / "voicebox-test-cache"
-_cache_stub.clear_profile_cache = lambda _profile_id: None
+_cache_stub.get_cache_key = lambda _audio_path, _reference_text: "test-cache-key"
+_cache_stub.get_cached_voice_prompt = lambda _cache_key: None
+_cache_stub.cache_voice_prompt = lambda _cache_key, _voice_prompt: None
+_cache_stub.clear_voice_prompt_cache = lambda: 0
+_cache_stub.clear_profile_cache = lambda _profile_id: 0
 sys.modules.setdefault("backend.utils.cache", _cache_stub)
 
 from backend.database import Base
