@@ -5,9 +5,11 @@ CONTAINER_NAME="${CONTAINER_NAME:-voicebox}"
 VOICEBOX_HOST="${VOICEBOX_HOST:-192.168.1.112}"
 VOICEBOX_PORT="${VOICEBOX_PORT:-17600}"
 VOICEBOX_REPO="${VOICEBOX_REPO:-https://github.com/carlolerro/voicebox-omv.git}"
-VOICEBOX_REF="${VOICEBOX_REF:-feature/mcp-profile-management}"
+VOICEBOX_REF="${VOICEBOX_REF:-feature/mcp-story-mode}"
 TUNNEL_ENV="${TUNNEL_ENV:-/etc/openai-tunnel.env}"
 TUNNEL_SERVICE="${TUNNEL_SERVICE:-openai-tunnel.service}"
+VERIFY_STORY_PROFILE_A="${VERIFY_STORY_PROFILE_A:-}"
+VERIFY_STORY_PROFILE_B="${VERIFY_STORY_PROFILE_B:-}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 ROLLBACK_IMAGE="voicebox-rollback:${TIMESTAMP}"
 
@@ -22,6 +24,12 @@ for command in docker curl systemctl; do
     exit 1
   }
 done
+
+if [[ -n "$VERIFY_STORY_PROFILE_A" && -z "$VERIFY_STORY_PROFILE_B" ]] || \
+   [[ -z "$VERIFY_STORY_PROFILE_A" && -n "$VERIFY_STORY_PROFILE_B" ]]; then
+  echo "Set both VERIFY_STORY_PROFILE_A and VERIFY_STORY_PROFILE_B, or neither." >&2
+  exit 1
+fi
 
 docker inspect "$CONTAINER_NAME" >/dev/null 2>&1 || {
   echo "Container '${CONTAINER_NAME}' was not found." >&2
@@ -182,6 +190,10 @@ EXPECTED = {
     "voicebox.create_profile",
     "voicebox.get_profile",
     "voicebox.add_profile_sample",
+    "voicebox.create_story",
+    "voicebox.get_story_status",
+    "voicebox.get_story",
+    "voicebox.resume_story",
 }
 
 async def main() -> None:
@@ -195,6 +207,94 @@ async def main() -> None:
 
 asyncio.run(main())
 PY
+
+if [[ -n "$VERIFY_STORY_PROFILE_A" ]]; then
+  echo "=== Real two-profile Story smoke test ==="
+  docker exec -i \
+    -e VERIFY_STORY_PROFILE_A="$VERIFY_STORY_PROFILE_A" \
+    -e VERIFY_STORY_PROFILE_B="$VERIFY_STORY_PROFILE_B" \
+    "$CONTAINER_NAME" python - <<'PY'
+import asyncio
+import os
+import time
+
+import httpx
+from fastmcp import Client
+
+
+def payload(result):
+    data = getattr(result, "data", None)
+    if isinstance(data, dict):
+        return data
+    structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    if isinstance(result, dict):
+        return result
+    raise RuntimeError(f"Unexpected MCP result shape: {result!r}")
+
+
+async def main() -> None:
+    profile_a = os.environ["VERIFY_STORY_PROFILE_A"]
+    profile_b = os.environ["VERIFY_STORY_PROFILE_B"]
+    async with Client("http://127.0.0.1:17493/mcp") as client:
+        created = payload(await client.call_tool(
+            "voicebox.create_story",
+            {
+                "title": "MCP Story OMV smoke",
+                "description": "Temporary two-profile production smoke test.",
+                "segments": [
+                    {"profile": profile_a, "text": "Questa è la prima voce della verifica."},
+                    {"profile": profile_b, "text": "Questa è la seconda voce della verifica."},
+                ],
+            },
+        ))
+        story_id = created["story_id"]
+        deadline = time.monotonic() + 900
+        status = created
+        while status["status"] not in {"completed", "failed"}:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Story {story_id} did not finish within 900 seconds")
+            await asyncio.sleep(2)
+            status = payload(await client.call_tool(
+                "voicebox.get_story_status", {"story_id": story_id}
+            ))
+        if status["status"] != "completed":
+            raise RuntimeError(f"Story {story_id} failed: {status.get('error')}")
+
+        detail = payload(await client.call_tool(
+            "voicebox.get_story", {"story_id": story_id}
+        ))
+        segments = detail.get("segments", [])
+        if [segment.get("position") for segment in segments] != [1, 2]:
+            raise RuntimeError(f"Unexpected Story order: {segments!r}")
+        if [segment.get("status") for segment in segments] != ["completed", "completed"]:
+            raise RuntimeError(f"Unexpected segment states: {segments!r}")
+
+        download_url = status.get("download_url")
+        if not download_url:
+            raise RuntimeError("Completed Story returned no download_url")
+        response = httpx.get(
+            f"http://127.0.0.1:17493{download_url}",
+            timeout=60,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        audio = response.content
+        if not content_type.startswith("audio/wav"):
+            raise RuntimeError(f"Unexpected content type: {content_type}")
+        if len(audio) <= 44 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+            raise RuntimeError("Downloaded Story is not a valid non-empty RIFF/WAVE file")
+        print(f"Story ID: {story_id}")
+        print(f"Segments: {[segment['status'] for segment in segments]}")
+        print(f"WAV bytes: {len(audio)}")
+
+
+asyncio.run(main())
+PY
+else
+  echo "Skipping real Story smoke test; VERIFY_STORY_PROFILE_A/B were not supplied."
+fi
 
 if [[ -f "$TUNNEL_ENV" ]]; then
   cp -a "$TUNNEL_ENV" "${TUNNEL_ENV}.bak-${TIMESTAMP}"
