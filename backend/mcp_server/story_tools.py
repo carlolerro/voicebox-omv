@@ -34,7 +34,9 @@ class StoryToolSegment(BaseModel):
         return clean
 
 
-def _coerce_segments(segments: list[StoryToolSegment | dict[str, Any]]) -> list[StoryToolSegment]:
+def _coerce_segments(
+    segments: list[StoryToolSegment | dict[str, Any]],
+) -> list[StoryToolSegment]:
     if not segments:
         raise ValueError("Story requires at least one segment")
     if len(segments) > MAX_STORY_SEGMENTS:
@@ -44,17 +46,25 @@ def _coerce_segments(segments: list[StoryToolSegment | dict[str, Any]]) -> list[
     total_chars = 0
     for position, raw in enumerate(segments, start=1):
         try:
-            segment = raw if isinstance(raw, StoryToolSegment) else StoryToolSegment.model_validate(raw)
+            segment = (
+                raw
+                if isinstance(raw, StoryToolSegment)
+                else StoryToolSegment.model_validate(raw)
+            )
         except Exception as exc:
             message = str(exc)
             if "10000" in message or "10,000" in message:
                 raise ValueError(
                     f"Story segment {position} cannot exceed 10000 characters"
                 ) from exc
-            raise ValueError(f"Invalid Story segment {position}: {message}") from exc
+            raise ValueError(
+                f"Invalid Story segment {position}: {message}"
+            ) from exc
         total_chars += len(segment.text)
         if total_chars > MAX_STORY_TOTAL_CHARS:
-            raise ValueError("Story text cannot exceed 100000 characters in total")
+            raise ValueError(
+                "Story text cannot exceed 100000 characters in total"
+            )
         normalized.append(segment)
     return normalized
 
@@ -64,6 +74,10 @@ def _load_story(story_id: str, db: Session) -> DBStory:
     if story is None:
         raise ValueError(f"Story '{story_id}' was not found")
     return story
+
+
+def _sanitized_error(value: str | None) -> str | None:
+    return orchestration._safe_error(value) if value else None
 
 
 def _status_payload(story: DBStory, db: Session) -> dict[str, Any]:
@@ -76,7 +90,7 @@ def _status_payload(story: DBStory, db: Session) -> dict[str, Any]:
         "completed_segments": story.completed_segments,
         "current_segment": story.current_segment_index,
         "failed_segment": story.failed_segment_index,
-        "error": story.error,
+        "error": _sanitized_error(story.error),
         "resumable": orchestration.is_story_resumable(story, db),
         "download_url": (
             f"/stories/{story.id}/export-audio" if render_exists else None
@@ -117,6 +131,8 @@ async def create_story(
         orchestration.start_story_workflow(story.id)
         orchestration._install_task_callback(story.id)
     except Exception as exc:
+        orchestration._active_story_ids.discard(story.id)
+        orchestration._story_tasks.pop(story.id, None)
         story.status = "failed"
         story.error = orchestration._safe_error(exc)
         db.commit()
@@ -141,7 +157,10 @@ def get_story(story_id: str, db: Session) -> dict[str, Any]:
             DBGeneration.duration.label("generation_duration"),
         )
         .join(DBVoiceProfile, DBStorySegment.profile_id == DBVoiceProfile.id)
-        .outerjoin(DBGeneration, DBStorySegment.generation_id == DBGeneration.id)
+        .outerjoin(
+            DBGeneration,
+            DBStorySegment.generation_id == DBGeneration.id,
+        )
         .filter(DBStorySegment.story_id == story_id)
         .order_by(DBStorySegment.position)
         .all()
@@ -155,7 +174,7 @@ def get_story(story_id: str, db: Session) -> dict[str, Any]:
             "profile_name": profile_name,
             "text": segment.text,
             "status": segment.status,
-            "error": segment.error,
+            "error": _sanitized_error(segment.error),
             "generation_id": segment.generation_id,
             "generation_status": generation_status,
             "duration": generation_duration,
@@ -198,7 +217,10 @@ def register_story_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         name="voicebox.get_story_status",
-        description="Get Story progress, failure details, resumability, and final download URL.",
+        description=(
+            "Get Story progress, failure details, resumability, and final "
+            "download URL."
+        ),
     )
     async def voicebox_get_story_status(story_id: str) -> dict[str, Any]:
         db = next(get_db())
@@ -209,7 +231,10 @@ def register_story_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         name="voicebox.get_story",
-        description="Get ordered Story segments and generation state without local file paths.",
+        description=(
+            "Get ordered Story segments and generation state without local "
+            "file paths."
+        ),
     )
     async def voicebox_get_story(story_id: str) -> dict[str, Any]:
         db = next(get_db())
