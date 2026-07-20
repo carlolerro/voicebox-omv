@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -22,9 +23,13 @@ from ..database import StoryItem as DBStoryItem
 from ..utils.audio import load_audio
 from . import stories
 
+_SAFE_STORY_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 def _expected_render_path(story_id: str) -> Path:
     """Return the only filesystem path a persisted Story render may use."""
+    if not story_id or not _SAFE_STORY_ID.fullmatch(story_id):
+        raise ValueError("Story id cannot be used as a storage directory")
     return (config.get_stories_dir() / story_id / "story.wav").resolve()
 
 
@@ -107,7 +112,10 @@ async def render_story_persistent(story_id: str, db: Session) -> str:
             os.fsync(output.fileno())
         os.replace(temporary_path, final_path)
     finally:
-        temporary_path.unlink(missing_ok=True)
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     stored_path = config.to_storage_path(final_path)
     story.render_audio_path = stored_path
@@ -120,8 +128,11 @@ async def render_story_persistent(story_id: str, db: Session) -> str:
 
 def resolve_valid_render_path(story: DBStory) -> Path | None:
     """Resolve a persisted render only inside its fixed Story directory."""
+    try:
+        expected = _expected_render_path(story.id)
+    except ValueError:
+        return None
     path = config.resolve_storage_path(story.render_audio_path)
-    expected = _expected_render_path(story.id)
     if path is None:
         return None
     try:
@@ -132,16 +143,22 @@ def resolve_valid_render_path(story: DBStory) -> Path | None:
 
 
 def remove_persistent_render(story: DBStory) -> None:
-    """Remove a Story render and clear its in-memory render metadata."""
+    """Best-effort removal of a Story render plus metadata invalidation."""
+    try:
+        expected = _expected_render_path(story.id)
+    except ValueError:
+        expected = None
     path = config.resolve_storage_path(story.render_audio_path)
-    expected = _expected_render_path(story.id)
-    if path is not None:
+    if path is not None and expected is not None:
         try:
             resolved = path.resolve()
         except OSError:
             resolved = None
         if resolved == expected:
-            resolved.unlink(missing_ok=True)
+            try:
+                resolved.unlink(missing_ok=True)
+            except OSError:
+                pass
             try:
                 resolved.parent.rmdir()
             except OSError:
