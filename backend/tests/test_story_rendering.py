@@ -1,4 +1,4 @@
-"""RED tests for strict persistent Story rendering.
+"""Tests for strict persistent Story rendering.
 
 The current Story mixer is intentionally permissive for the manual editor. MCP
 Story completion needs a strict preflight and a persistent atomic WAV while
@@ -7,13 +7,11 @@ still delegating the actual mix to ``services.stories.export_story_audio``.
 
 from __future__ import annotations
 
-import asyncio
 import io
 import os
 import tempfile
 import unittest
 import wave
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import create_engine
@@ -46,7 +44,7 @@ def _wav_bytes(sample_rate: int = 24_000, duration_ms: int = 100) -> bytes:
     return buffer.getvalue()
 
 
-class StoryRenderingRedTestCase(unittest.IsolatedAsyncioTestCase):
+class StoryRenderingTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.original_data_dir = config.get_data_dir()
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -140,15 +138,18 @@ class StoryRenderingRedTestCase(unittest.IsolatedAsyncioTestCase):
             audio_path=config.to_storage_path(source_path),
         )
         rendered_bytes = _wav_bytes(duration_ms=200)
+        expected_final_path = config.get_stories_dir() / self.story.id / "story.wav"
+        expected_temporary_path = expected_final_path.with_name("story.wav.tmp")
 
         with patch.object(
             stories,
             "export_story_audio",
             new=AsyncMock(return_value=rendered_bytes),
-        ) as mixer_mock, patch(
-            "backend.services.story_rendering.os.replace",
-            wraps=os.replace,
-        ) as replace_mock:
+        ) as mixer_mock, patch.object(
+            rendering,
+            "os",
+            wraps=os,
+        ) as rendering_os_mock:
             stored_path = await rendering.render_story_persistent(
                 self.story.id,
                 self.db,
@@ -157,13 +158,16 @@ class StoryRenderingRedTestCase(unittest.IsolatedAsyncioTestCase):
         self.db.refresh(self.story)
         final_path = config.resolve_storage_path(stored_path)
         self.assertIsNotNone(final_path)
-        self.assertEqual(final_path, config.get_data_dir() / "stories" / self.story.id / "story.wav")
+        self.assertEqual(final_path, expected_final_path)
         self.assertEqual(final_path.read_bytes(), rendered_bytes)
         self.assertEqual(self.story.render_audio_path, stored_path)
         self.assertIsNotNone(self.story.rendered_at)
-        self.assertFalse((final_path.parent / "story.wav.tmp").exists())
+        self.assertFalse(expected_temporary_path.exists())
         mixer_mock.assert_awaited_once_with(self.story.id, self.db)
-        replace_mock.assert_called_once()
+        rendering_os_mock.replace.assert_called_once_with(
+            expected_temporary_path,
+            expected_final_path,
+        )
 
     async def test_manual_story_export_remains_permissive_for_missing_audio(self) -> None:
         """The existing editor/export contract must remain backward compatible."""
