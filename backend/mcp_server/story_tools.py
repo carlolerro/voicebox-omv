@@ -16,14 +16,20 @@ from ..database import get_db
 from ..services import story_orchestration as orchestration
 from ..services import story_rendering
 
-MAX_STORY_SEGMENTS = 100
-MAX_STORY_SEGMENT_CHARS = 10_000
-MAX_STORY_TOTAL_CHARS = 100_000
+MAX_STORY_SEGMENTS = orchestration.MAX_STORY_SEGMENTS
+MAX_STORY_SEGMENT_CHARS = orchestration.MAX_STORY_SEGMENT_CHARS
+MAX_STORY_TOTAL_CHARS = orchestration.MAX_STORY_TOTAL_CHARS
 
 
 class StoryToolSegment(BaseModel):
-    profile: str = Field(min_length=1, max_length=100)
-    text: str = Field(min_length=1, max_length=MAX_STORY_SEGMENT_CHARS)
+    profile: str = Field(
+        min_length=1,
+        max_length=orchestration.MAX_STORY_PROFILE_REF_CHARS,
+    )
+    text: str = Field(
+        min_length=1,
+        max_length=MAX_STORY_SEGMENT_CHARS,
+    )
 
     @field_validator("profile", "text")
     @classmethod
@@ -40,7 +46,9 @@ def _coerce_segments(
     if not segments:
         raise ValueError("Story requires at least one segment")
     if len(segments) > MAX_STORY_SEGMENTS:
-        raise ValueError("Story cannot contain more than 100 segments")
+        raise ValueError(
+            f"Story cannot contain more than {MAX_STORY_SEGMENTS} segments"
+        )
 
     normalized: list[StoryToolSegment] = []
     total_chars = 0
@@ -55,7 +63,8 @@ def _coerce_segments(
             message = str(exc)
             if "10000" in message or "10,000" in message:
                 raise ValueError(
-                    f"Story segment {position} cannot exceed 10000 characters"
+                    f"Story segment {position} cannot exceed "
+                    f"{MAX_STORY_SEGMENT_CHARS} characters"
                 ) from exc
             raise ValueError(
                 f"Invalid Story segment {position}: {message}"
@@ -63,7 +72,8 @@ def _coerce_segments(
         total_chars += len(segment.text)
         if total_chars > MAX_STORY_TOTAL_CHARS:
             raise ValueError(
-                "Story text cannot exceed 100000 characters in total"
+                f"Story text cannot exceed {MAX_STORY_TOTAL_CHARS} "
+                "characters in total"
             )
         normalized.append(segment)
     return normalized
@@ -108,11 +118,20 @@ async def create_story(
     clean_title = (title or "").strip()
     if not clean_title:
         raise ValueError("Story title must not be empty")
-    if len(clean_title) > 100:
-        raise ValueError("Story title cannot exceed 100 characters")
+    if len(clean_title) > orchestration.MAX_STORY_TITLE_CHARS:
+        raise ValueError(
+            "Story title cannot exceed "
+            f"{orchestration.MAX_STORY_TITLE_CHARS} characters"
+        )
     clean_description = (description or "").strip() or None
-    if clean_description and len(clean_description) > 500:
-        raise ValueError("Story description cannot exceed 500 characters")
+    if (
+        clean_description
+        and len(clean_description) > orchestration.MAX_STORY_DESCRIPTION_CHARS
+    ):
+        raise ValueError(
+            "Story description cannot exceed "
+            f"{orchestration.MAX_STORY_DESCRIPTION_CHARS} characters"
+        )
 
     normalized = _coerce_segments(segments)
     story = await orchestration.create_story_workflow(
@@ -129,7 +148,6 @@ async def create_story(
     )
     try:
         orchestration.start_story_workflow(story.id)
-        orchestration._install_task_callback(story.id)
     except Exception as exc:
         orchestration._active_story_ids.discard(story.id)
         orchestration._story_tasks.pop(story.id, None)
