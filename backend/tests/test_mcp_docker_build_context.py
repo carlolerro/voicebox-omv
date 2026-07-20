@@ -43,6 +43,29 @@ class DockerBuildContextRegressionTestCase(unittest.TestCase):
             runtime_entrypoint.read_text(encoding="utf-8"),
         )
 
+    def test_omv_scripts_verify_all_story_tools_and_optional_smoke_profiles(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        verify_path = repo_root / "scripts" / "verify_mcp_profile_management_omv.sh"
+        deploy_path = repo_root / "scripts" / "deploy_mcp_profile_management_omv.sh"
+        if not verify_path.is_file() or not deploy_path.is_file():
+            # Production image intentionally excludes source deployment scripts.
+            return
+
+        verify_script = verify_path.read_text(encoding="utf-8")
+        deploy_script = deploy_path.read_text(encoding="utf-8")
+        for tool_name in (
+            "voicebox.create_story",
+            "voicebox.get_story_status",
+            "voicebox.get_story",
+            "voicebox.resume_story",
+        ):
+            self.assertIn(tool_name, verify_script)
+            self.assertIn(tool_name, deploy_script)
+        self.assertIn("VERIFY_STORY_PROFILE_A", deploy_script)
+        self.assertIn("VERIFY_STORY_PROFILE_B", deploy_script)
+        self.assertIn("RIFF", deploy_script)
+        self.assertIn("WAVE", deploy_script)
+
 
 if __name__ == "__main__":
     unittest.main()
