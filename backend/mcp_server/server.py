@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 
 from .context import ClientIdMiddleware
 from .profile_tools import register_profile_tools
+from .story_tools import register_story_tools
 from .tools import register_tools
 
 
@@ -32,11 +33,16 @@ def build_mcp_server() -> FastMCP:
             "`voicebox.list_profiles` and `voicebox.get_profile`; create them "
             "with `voicebox.list_preset_voices`, `voicebox.create_profile`, "
             "and `voicebox.add_profile_sample`; generate speech with "
-            "`voicebox.speak`; and transcribe audio with `voicebox.transcribe`."
+            "`voicebox.speak`; create ordered multi-profile audio with "
+            "`voicebox.create_story`, poll it with `voicebox.get_story_status`, "
+            "inspect it with `voicebox.get_story`, and continue failures with "
+            "`voicebox.resume_story`; and transcribe audio with "
+            "`voicebox.transcribe`."
         ),
     )
     register_tools(mcp)
     register_profile_tools(mcp)
+    register_story_tools(mcp)
     return mcp
 
 

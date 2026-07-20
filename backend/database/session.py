@@ -44,6 +44,21 @@ def init_db() -> None:
     run_migrations(engine)
     Base.metadata.create_all(bind=engine)
 
+    # A killed process cannot resume its in-memory coordinator. Preserve durable
+    # segment progress and make any active Story explicitly resumable instead.
+    recovery_db = SessionLocal()
+    try:
+        from ..services.story_orchestration import recover_interrupted_story_workflows
+
+        recovered = recover_interrupted_story_workflows(recovery_db)
+        if recovered:
+            logger.info("Marked %d interrupted Story workflow(s) as failed", recovered)
+    except Exception as exc:
+        recovery_db.rollback()
+        logger.warning("Could not recover interrupted Story workflows: %s", exc)
+    finally:
+        recovery_db.close()
+
     # Create default audio channel if it doesn't exist
     db = SessionLocal()
     try:

@@ -2,9 +2,10 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-voicebox-mcp-profile:test}"
-CONTAINER_NAME="${CONTAINER_NAME:-voicebox-mcp-profile-test}"
-DATA_VOLUME="${DATA_VOLUME:-voicebox-mcp-profile-test-data}"
+BUILD_CONTEXT="${VOICEBOX_BUILD_CONTEXT:-$ROOT_DIR}"
+IMAGE_NAME="${IMAGE_NAME:-voicebox-mcp-story:test}"
+CONTAINER_NAME="${CONTAINER_NAME:-voicebox-mcp-story-test}"
+DATA_VOLUME="${DATA_VOLUME:-voicebox-mcp-story-test-data}"
 HOST_PORT="${HOST_PORT:-17601}"
 REMOVE_IMAGE="${REMOVE_IMAGE:-0}"
 
@@ -17,13 +18,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cd "$ROOT_DIR"
-
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || true
 
-echo "[1/7] Building the existing Voicebox Docker image..."
-docker build -t "$IMAGE_NAME" .
+echo "[1/7] Building the Voicebox Story branch..."
+docker build -t "$IMAGE_NAME" "$BUILD_CONTEXT"
 
 echo "[2/7] Starting an isolated Voicebox container..."
 docker volume create "$DATA_VOLUME" >/dev/null
@@ -52,7 +51,17 @@ fi
 curl -fsS "http://127.0.0.1:${HOST_PORT}/health"
 echo
 
-echo "[4/7] Running non-GPU MCP tests and syntax compilation..."
+echo "[4/7] Running non-GPU MCP/Story tests and syntax compilation..."
+docker exec "$CONTAINER_NAME" python -m unittest \
+  backend.tests.test_story_orchestration_models \
+  backend.tests.test_story_profile_resolution \
+  backend.tests.test_story_rendering \
+  backend.tests.test_story_orchestration \
+  backend.tests.test_story_orchestration_guards \
+  backend.tests.test_mcp_story_tools \
+  backend.tests.test_story_http_compatibility \
+  backend.tests.test_story_restart_recovery \
+  -v
 docker exec "$CONTAINER_NAME" \
   python -m unittest discover -s backend/tests -p 'test_mcp_*.py' -v
 docker exec "$CONTAINER_NAME" python -m compileall -q backend
@@ -137,6 +146,10 @@ EXPECTED = {
     "voicebox.create_profile",
     "voicebox.get_profile",
     "voicebox.add_profile_sample",
+    "voicebox.create_story",
+    "voicebox.get_story_status",
+    "voicebox.get_story",
+    "voicebox.resume_story",
 }
 
 
@@ -219,5 +232,5 @@ asyncio.run(main())
 PY
 
 echo
-echo "MCP profile-management and tunnel-routing verification completed successfully."
+echo "MCP profile-management, Story-mode, and tunnel-routing verification completed successfully."
 echo "The test image remains available as: ${IMAGE_NAME}"

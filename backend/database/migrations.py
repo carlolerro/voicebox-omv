@@ -36,6 +36,8 @@ def run_migrations(engine) -> None:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
 
+    _migrate_stories(engine, inspector, tables)
+    _migrate_story_segments(engine, tables)
     _migrate_story_items(engine, inspector, tables)
     _migrate_profiles(engine, inspector, tables)
     _migrate_generations(engine, inspector, tables)
@@ -47,6 +49,7 @@ def run_migrations(engine) -> None:
 
 
 # -- helpers ---------------------------------------------------------------
+
 
 def _get_columns(inspector, table: str) -> set[str]:
     return {col["name"] for col in inspector.get_columns(table)}
@@ -61,6 +64,83 @@ def _add_column(engine, table: str, column_sql: str, label: str) -> None:
 
 
 # -- per-table migrations --------------------------------------------------
+
+
+def _migrate_stories(engine, inspector, tables: set[str]) -> None:
+    """Add persistent asynchronous orchestration state to existing Stories."""
+    if "stories" not in tables:
+        return
+
+    columns = _get_columns(inspector, "stories")
+    additions = [
+        ("status", "status VARCHAR NOT NULL DEFAULT 'draft'"),
+        ("error", "error TEXT"),
+        ("render_audio_path", "render_audio_path VARCHAR"),
+        ("rendered_at", "rendered_at DATETIME"),
+        ("total_segments", "total_segments INTEGER NOT NULL DEFAULT 0"),
+        (
+            "completed_segments",
+            "completed_segments INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("current_segment_index", "current_segment_index INTEGER"),
+        ("failed_segment_index", "failed_segment_index INTEGER"),
+    ]
+    for name, column_sql in additions:
+        if name not in columns:
+            _add_column(engine, "stories", column_sql, name)
+
+
+def _migrate_story_segments(engine, tables: set[str]) -> None:
+    """Create the persistent ordered Story workflow segments table."""
+    required_tables = {"stories", "profiles", "generations"}
+    if not required_tables <= tables:
+        return
+
+    created = "story_segments" not in tables
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS story_segments (
+                    id VARCHAR PRIMARY KEY,
+                    story_id VARCHAR NOT NULL,
+                    position INTEGER NOT NULL,
+                    profile_id VARCHAR NOT NULL,
+                    text TEXT NOT NULL,
+                    generation_id VARCHAR,
+                    status VARCHAR NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (story_id) REFERENCES stories(id),
+                    FOREIGN KEY (profile_id) REFERENCES profiles(id),
+                    FOREIGN KEY (generation_id) REFERENCES generations(id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                uq_story_segments_story_position
+                ON story_segments (story_id, position)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_story_segments_story_status
+                ON story_segments (story_id, status)
+                """
+            )
+        )
+
+    if created:
+        logger.info("Created story_segments table")
+
 
 def _migrate_story_items(engine, inspector, tables: set[str]) -> None:
     if "story_items" not in tables:

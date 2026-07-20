@@ -3,7 +3,19 @@
 from datetime import datetime
 import uuid
 
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, ForeignKey, Boolean, JSON
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.ext.declarative import declarative_base
 
 from ..utils.capture_chords import (
@@ -93,8 +105,46 @@ class Story(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False)
     description = Column(Text)
+    status = Column(String, nullable=False, default="draft")
+    error = Column(Text, nullable=True)
+    render_audio_path = Column(String, nullable=True)
+    rendered_at = Column(DateTime, nullable=True)
+    total_segments = Column(Integer, nullable=False, default=0)
+    completed_segments = Column(Integer, nullable=False, default=0)
+    current_segment_index = Column(Integer, nullable=True)
+    failed_segment_index = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class StorySegment(Base):
+    """Persistent ordered segment used by asynchronous Story orchestration."""
+
+    __tablename__ = "story_segments"
+    __table_args__ = (
+        UniqueConstraint(
+            "story_id",
+            "position",
+            name="uq_story_segments_story_position",
+        ),
+        Index("ix_story_segments_story_status", "story_id", "status"),
+    )
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    story_id = Column(String, ForeignKey("stories.id"), nullable=False)
+    position = Column(Integer, nullable=False)
+    profile_id = Column(String, ForeignKey("profiles.id"), nullable=False)
+    text = Column(Text, nullable=False)
+    generation_id = Column(String, ForeignKey("generations.id"), nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
 
 
 class StoryItem(Base):

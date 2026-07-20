@@ -1,0 +1,133 @@
+---
+title: "MCP Story Mode"
+description: "Generate an ordered multi-profile Story asynchronously, resume failures, and download one persistent WAV."
+---
+
+## Overview
+
+MCP Story mode turns an ordered script into a normal Voicebox Story. Each
+segment names one existing voice profile and contains the exact text to process.
+Voicebox generates the segments through the same serial TTS queue used by
+`voicebox.speak`, adds every completed Generation to the existing Story
+timeline, then persists one final WAV.
+
+The workflow is asynchronous. `voicebox.create_story` returns immediately;
+use `voicebox.get_story_status` to follow progress.
+
+## Create a Story
+
+```ts
+voicebox.create_story({
+  title: "Capitolo 17 - Come lavora Spark",
+  description: "Dialogo introduttivo",
+  segments: [
+    { profile: "Serena", text: "Benvenuti al nuovo capitolo." },
+    { profile: "Ryan", text: "Partiamo dal motore di esecuzione." },
+  ],
+})
+```
+
+The V1 segment contract is intentionally small: `profile + text`. Language,
+engine, preset metadata, cloning references, personality behavior, and profile
+effects are inherited from the selected Voicebox profile.
+
+Limits:
+
+- 1 to 100 ordered segments
+- 10,000 characters per segment
+- 100,000 characters across the complete Story
+- exact profile id or one unambiguous case-insensitive profile name
+
+All profiles are validated before the Story is written. Preset profiles must
+reference an available built-in voice. Cloned profiles must already have at
+least one sample.
+
+The create response contains the durable `story_id` and starts in `queued`:
+
+```json
+{
+  "story_id": "…",
+  "title": "Capitolo 17 - Come lavora Spark",
+  "status": "queued",
+  "total_segments": 2,
+  "completed_segments": 0,
+  "current_segment": null,
+  "failed_segment": null,
+  "error": null,
+  "resumable": false,
+  "download_url": null,
+  "status_tool": "voicebox.get_story_status"
+}
+```
+
+## Poll progress
+
+```ts
+voicebox.get_story_status({ story_id: "…" })
+```
+
+Workflow states are `queued`, `generating`, `rendering`, `completed`, and
+`failed`. Only one TTS inference runs at a time, so segment order and GPU usage
+remain deterministic.
+
+A completed Story returns an HTTP URL rather than embedding audio as Base64:
+
+```json
+{
+  "story_id": "…",
+  "status": "completed",
+  "completed_segments": 2,
+  "total_segments": 2,
+  "download_url": "/stories/<story-id>/export-audio"
+}
+```
+
+The URL serves the persistent `audio/wav` render. The same Story remains
+available in Voicebox's existing Story editor.
+
+## Inspect segments
+
+```ts
+voicebox.get_story({ story_id: "…" })
+```
+
+This returns ordered segment position, profile id/name, source text, segment
+status, Generation id/status, and duration. Local filesystem paths are never
+returned through the MCP Story tools.
+
+## Failure and resume
+
+Processing stops at the first failed segment. Completed Generations and Story
+items are preserved, later segments remain pending, and the status response
+includes `failed_segment`, a bounded error message, and `resumable: true`.
+
+```ts
+voicebox.resume_story({ story_id: "…" })
+```
+
+Resume is explicit and idempotent:
+
+- completed segments are not generated again
+- an existing failed Generation is retried with the same Generation id
+- a completed Generation that was not yet attached is attached without new TTS
+- a missing Generation record is replaced once
+- if all clips exist and only rendering failed, resume performs render only
+
+After an unclean server shutdown, active Stories are marked failed and become
+resumable; Voicebox does not start unexpected GPU work automatically.
+
+## Editing and download behavior
+
+While a Story is `queued`, `generating`, or `rendering`, manual Story mutations
+return HTTP `409` to protect timeline order. Completed and failed Stories can be
+opened normally. A later manual timeline edit invalidates the old persistent
+render, after which the existing on-demand Story export remains available.
+
+The download route is unchanged:
+
+```text
+GET /stories/<story-id>/export-audio
+```
+
+For MCP-completed Stories it serves the saved WAV directly. Draft/manual
+Stories continue to use the original permissive Story mixer.
