@@ -121,5 +121,22 @@ def remove_persistent_render(story: DBStory) -> None:
     path = config.resolve_storage_path(story.render_audio_path)
     if path is not None:
         path.unlink(missing_ok=True)
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
     story.render_audio_path = None
     story.rendered_at = None
+
+
+def invalidate_story_render(story: DBStory, db: Session) -> None:
+    """Invalidate a stale render after a successful manual timeline edit."""
+    remove_persistent_render(story)
+    if story.status == "completed":
+        story.status = "draft"
+        story.error = None
+        story.current_segment_index = None
+        story.failed_segment_index = None
+    story.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(story)
