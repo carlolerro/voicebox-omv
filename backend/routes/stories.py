@@ -3,15 +3,41 @@
 import io
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import database, models
-from ..services import stories
+from ..services import stories, story_rendering
 from ..app import safe_content_disposition
 from ..database import get_db
 
 router = APIRouter()
+ACTIVE_STORY_STATUSES = {"queued", "generating", "rendering"}
+
+
+def _load_story_or_404(story_id: str, db: Session):
+    story = db.query(database.Story).filter_by(id=story_id).first()
+    if story is None:
+        raise HTTPException(status_code=404, detail="Story not found")
+    return story
+
+
+def _reject_active_story_mutation(story_id: str, db: Session):
+    story = _load_story_or_404(story_id, db)
+    if story.status in ACTIVE_STORY_STATUSES:
+        raise HTTPException(status_code=409, detail="Story is currently processing")
+    return story
+
+
+def _invalidate_after_timeline_change(story, db: Session) -> None:
+    story_rendering.invalidate_story_render(story, db)
+
+
+def _download_filename(story) -> str:
+    safe_name = "".join(
+        c for c in story.name if c.isalnum() or c in (" ", "-", "_")
+    ).strip()
+    return f"{safe_name or 'story'}.wav"
 
 
 @router.get("/stories", response_model=list[models.StoryResponse])
@@ -51,6 +77,7 @@ async def update_story(
     db: Session = Depends(get_db),
 ):
     """Update a story."""
+    _reject_active_story_mutation(story_id, db)
     story = await stories.update_story(story_id, data, db)
     if not story:
         raise HTTPException(status_code=404, detail="Story not found")
@@ -62,7 +89,12 @@ async def delete_story(
     story_id: str,
     db: Session = Depends(get_db),
 ):
-    """Delete a story."""
+    """Delete a terminal story, its workflow rows, and persisted render."""
+    story = _reject_active_story_mutation(story_id, db)
+    story_rendering.remove_persistent_render(story)
+    db.query(database.StorySegment).filter_by(story_id=story_id).delete(
+        synchronize_session=False
+    )
     success = await stories.delete_story(story_id, db)
     if not success:
         raise HTTPException(status_code=404, detail="Story not found")
@@ -76,9 +108,11 @@ async def add_story_item(
     db: Session = Depends(get_db),
 ):
     """Add a generation to a story."""
+    story = _reject_active_story_mutation(story_id, db)
     item = await stories.add_item_to_story(story_id, data, db)
     if not item:
         raise HTTPException(status_code=404, detail="Story or generation not found")
+    _invalidate_after_timeline_change(story, db)
     return item
 
 
@@ -89,9 +123,11 @@ async def remove_story_item(
     db: Session = Depends(get_db),
 ):
     """Remove a story item from a story."""
+    story = _reject_active_story_mutation(story_id, db)
     success = await stories.remove_item_from_story(story_id, item_id, db)
     if not success:
         raise HTTPException(status_code=404, detail="Story item not found")
+    _invalidate_after_timeline_change(story, db)
     return {"message": "Item removed successfully"}
 
 
@@ -102,9 +138,11 @@ async def update_story_item_times(
     db: Session = Depends(get_db),
 ):
     """Update story item timecodes."""
+    story = _reject_active_story_mutation(story_id, db)
     success = await stories.update_story_item_times(story_id, data, db)
     if not success:
         raise HTTPException(status_code=400, detail="Invalid timecode update request")
+    _invalidate_after_timeline_change(story, db)
     return {"message": "Item timecodes updated successfully"}
 
 
@@ -115,11 +153,14 @@ async def reorder_story_items(
     db: Session = Depends(get_db),
 ):
     """Reorder story items and recalculate timecodes."""
+    story = _reject_active_story_mutation(story_id, db)
     items = await stories.reorder_story_items(story_id, data.generation_ids, db)
     if items is None:
         raise HTTPException(
-            status_code=400, detail="Invalid reorder request - ensure all generation IDs belong to this story"
+            status_code=400,
+            detail="Invalid reorder request - ensure all generation IDs belong to this story",
         )
+    _invalidate_after_timeline_change(story, db)
     return items
 
 
@@ -131,9 +172,11 @@ async def move_story_item(
     db: Session = Depends(get_db),
 ):
     """Move a story item (update position and/or track)."""
+    story = _reject_active_story_mutation(story_id, db)
     item = await stories.move_story_item(story_id, item_id, data, db)
     if item is None:
         raise HTTPException(status_code=404, detail="Story item not found")
+    _invalidate_after_timeline_change(story, db)
     return item
 
 
@@ -145,9 +188,14 @@ async def trim_story_item(
     db: Session = Depends(get_db),
 ):
     """Trim a story item."""
+    story = _reject_active_story_mutation(story_id, db)
     item = await stories.trim_story_item(story_id, item_id, data, db)
     if item is None:
-        raise HTTPException(status_code=404, detail="Story item not found or invalid trim values")
+        raise HTTPException(
+            status_code=404,
+            detail="Story item not found or invalid trim values",
+        )
+    _invalidate_after_timeline_change(story, db)
     return item
 
 
@@ -159,9 +207,11 @@ async def update_story_item_volume(
     db: Session = Depends(get_db),
 ):
     """Set a story item's per-clip volume (linear gain, 0.0–2.0)."""
+    story = _reject_active_story_mutation(story_id, db)
     item = await stories.update_story_item_volume(story_id, item_id, data, db)
     if item is None:
         raise HTTPException(status_code=404, detail="Story item not found")
+    _invalidate_after_timeline_change(story, db)
     return item
 
 
@@ -173,9 +223,14 @@ async def split_story_item(
     db: Session = Depends(get_db),
 ):
     """Split a story item at a given time, creating two clips."""
+    story = _reject_active_story_mutation(story_id, db)
     items = await stories.split_story_item(story_id, item_id, data, db)
     if items is None:
-        raise HTTPException(status_code=404, detail="Story item not found or invalid split point")
+        raise HTTPException(
+            status_code=404,
+            detail="Story item not found or invalid split point",
+        )
+    _invalidate_after_timeline_change(story, db)
     return items
 
 
@@ -186,9 +241,11 @@ async def duplicate_story_item(
     db: Session = Depends(get_db),
 ):
     """Duplicate a story item."""
+    story = _reject_active_story_mutation(story_id, db)
     item = await stories.duplicate_story_item(story_id, item_id, db)
     if item is None:
         raise HTTPException(status_code=404, detail="Story item not found")
+    _invalidate_after_timeline_change(story, db)
     return item
 
 
@@ -200,9 +257,11 @@ async def set_story_item_version(
     db: Session = Depends(get_db),
 ):
     """Pin a story item to a specific generation version."""
+    story = _reject_active_story_mutation(story_id, db)
     item = await stories.set_story_item_version(story_id, item_id, data, db)
     if item is None:
         raise HTTPException(status_code=404, detail="Story item or version not found")
+    _invalidate_after_timeline_change(story, db)
     return item
 
 
@@ -211,25 +270,30 @@ async def export_story_audio(
     story_id: str,
     db: Session = Depends(get_db),
 ):
-    """Export story as single mixed audio file."""
+    """Serve a persisted Story render or fall back to legacy on-demand mixing."""
     try:
-        story = db.query(database.Story).filter_by(id=story_id).first()
-        if not story:
-            raise HTTPException(status_code=404, detail="Story not found")
+        story = _load_story_or_404(story_id, db)
+        filename = _download_filename(story)
+        headers = {
+            "Content-Disposition": safe_content_disposition("attachment", filename)
+        }
+
+        persisted = story_rendering.resolve_valid_render_path(story)
+        if persisted is not None:
+            return FileResponse(
+                str(persisted),
+                media_type="audio/wav",
+                headers=headers,
+            )
 
         audio_bytes = await stories.export_story_audio(story_id, db)
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Story has no audio items")
 
-        safe_name = "".join(c for c in story.name if c.isalnum() or c in (" ", "-", "_")).strip()
-        if not safe_name:
-            safe_name = "story"
-        filename = f"{safe_name}.wav"
-
         return StreamingResponse(
             io.BytesIO(audio_bytes),
             media_type="audio/wav",
-            headers={"Content-Disposition": safe_content_disposition("attachment", filename)},
+            headers=headers,
         )
     except HTTPException:
         raise
