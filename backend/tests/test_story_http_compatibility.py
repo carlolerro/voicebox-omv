@@ -26,7 +26,12 @@ from backend.database import Story as DBStory
 from backend.database import StoryItem as DBStoryItem
 from backend.database import StorySegment as DBStorySegment
 from backend.database import VoiceProfile as DBVoiceProfile
-from backend.routes import stories as story_routes
+
+# Story routes historically import safe_content_disposition from backend.app.
+# Import the app first, matching production startup, so direct test collection
+# does not create a stories -> app -> register_routers -> stories cycle.
+import backend.app as _backend_app  # noqa: F401,E402
+from backend.routes import stories as story_routes  # noqa: E402
 
 
 class StoryHTTPCompatibilityTestCase(unittest.TestCase):
@@ -90,7 +95,11 @@ class StoryHTTPCompatibilityTestCase(unittest.TestCase):
         self.db.commit()
         return story
 
-    def _generation_item(self, story: DBStory, suffix: str = "1") -> tuple[DBGeneration, DBStoryItem]:
+    def _generation_item(
+        self,
+        story: DBStory,
+        suffix: str = "1",
+    ) -> tuple[DBGeneration, DBStoryItem]:
         generation = DBGeneration(
             id=f"generation-{suffix}",
             profile_id=self.profile.id,
@@ -134,7 +143,10 @@ class StoryHTTPCompatibilityTestCase(unittest.TestCase):
                     json={"name": "Changed", "description": None},
                 )
                 self.assertEqual(response.status_code, 409)
-                self.assertEqual(response.json()["detail"], "Story is currently processing")
+                self.assertEqual(
+                    response.json()["detail"],
+                    "Story is currently processing",
+                )
 
     def test_persistent_render_is_served_without_rebuilding(self) -> None:
         story = self._story("completed", status="completed")
@@ -148,7 +160,9 @@ class StoryHTTPCompatibilityTestCase(unittest.TestCase):
             response = self.client.get(f"/stories/{story.id}/export-audio")
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.headers["content-type"].startswith("audio/wav"))
+        self.assertTrue(
+            response.headers["content-type"].startswith("audio/wav")
+        )
         self.assertEqual(response.content, path.read_bytes())
         mixer.assert_not_awaited()
 
@@ -166,7 +180,9 @@ class StoryHTTPCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(response.content, audio)
         mixer.assert_awaited_once()
 
-    def test_terminal_delete_removes_segments_render_and_items_but_keeps_generation(self) -> None:
+    def test_terminal_delete_removes_segments_render_and_items_but_keeps_generation(
+        self,
+    ) -> None:
         story = self._story("failed", status="failed")
         generation, _item = self._generation_item(story)
         segment = DBStorySegment(
@@ -186,10 +202,20 @@ class StoryHTTPCompatibilityTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.db.expire_all()
-        self.assertIsNone(self.db.query(DBStory).filter_by(id=story.id).first())
-        self.assertEqual(self.db.query(DBStorySegment).filter_by(story_id=story.id).count(), 0)
-        self.assertEqual(self.db.query(DBStoryItem).filter_by(story_id=story.id).count(), 0)
-        self.assertIsNotNone(self.db.query(DBGeneration).filter_by(id=generation.id).first())
+        self.assertIsNone(
+            self.db.query(DBStory).filter_by(id=story.id).first()
+        )
+        self.assertEqual(
+            self.db.query(DBStorySegment).filter_by(story_id=story.id).count(),
+            0,
+        )
+        self.assertEqual(
+            self.db.query(DBStoryItem).filter_by(story_id=story.id).count(),
+            0,
+        )
+        self.assertIsNotNone(
+            self.db.query(DBGeneration).filter_by(id=generation.id).first()
+        )
         self.assertFalse(render_path.exists())
 
     def test_terminal_timeline_edit_invalidates_stale_render(self) -> None:
