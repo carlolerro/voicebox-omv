@@ -14,9 +14,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+# Profile services import cache helpers whose production implementation depends
+# on torch. Keep this stub API-complete because this test imports the full app
+# and must also pass when collected independently or in a different order.
 _cache_stub = ModuleType("backend.utils.cache")
 _cache_stub._get_cache_dir = lambda: Path(tempfile.gettempdir()) / "voicebox-test-cache"
-_cache_stub.clear_profile_cache = lambda _profile_id: None
+_cache_stub.get_cache_key = lambda _audio_path, _reference_text: "test-cache-key"
+_cache_stub.get_cached_voice_prompt = lambda _cache_key: None
+_cache_stub.cache_voice_prompt = lambda _cache_key, _voice_prompt: None
+_cache_stub.clear_voice_prompt_cache = lambda: 0
+_cache_stub.clear_profile_cache = lambda _profile_id: 0
 sys.modules.setdefault("backend.utils.cache", _cache_stub)
 
 from backend import config
@@ -185,36 +192,38 @@ class StoryHTTPCompatibilityTestCase(unittest.TestCase):
     ) -> None:
         story = self._story("failed", status="failed")
         generation, _item = self._generation_item(story)
+        story_id = story.id
+        generation_id = generation.id
         segment = DBStorySegment(
             id="segment-1",
-            story_id=story.id,
+            story_id=story_id,
             position=1,
             profile_id=self.profile.id,
             text="Hello",
-            generation_id=generation.id,
+            generation_id=generation_id,
             status="completed",
         )
         self.db.add(segment)
         self.db.commit()
         render_path = self._render(story)
 
-        response = self.client.delete(f"/stories/{story.id}")
+        response = self.client.delete(f"/stories/{story_id}")
 
         self.assertEqual(response.status_code, 200)
         self.db.expire_all()
         self.assertIsNone(
-            self.db.query(DBStory).filter_by(id=story.id).first()
+            self.db.query(DBStory).filter_by(id=story_id).first()
         )
         self.assertEqual(
-            self.db.query(DBStorySegment).filter_by(story_id=story.id).count(),
+            self.db.query(DBStorySegment).filter_by(story_id=story_id).count(),
             0,
         )
         self.assertEqual(
-            self.db.query(DBStoryItem).filter_by(story_id=story.id).count(),
+            self.db.query(DBStoryItem).filter_by(story_id=story_id).count(),
             0,
         )
         self.assertIsNotNone(
-            self.db.query(DBGeneration).filter_by(id=generation.id).first()
+            self.db.query(DBGeneration).filter_by(id=generation_id).first()
         )
         self.assertFalse(render_path.exists())
 
