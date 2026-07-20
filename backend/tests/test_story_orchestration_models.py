@@ -108,7 +108,8 @@ class StoryOrchestrationModelRedTestCase(unittest.TestCase):
                         """
                         CREATE TABLE generations (
                             id VARCHAR PRIMARY KEY,
-                            profile_id VARCHAR NOT NULL
+                            profile_id VARCHAR NOT NULL,
+                            audio_path VARCHAR NOT NULL DEFAULT ''
                         )
                         """
                     )
