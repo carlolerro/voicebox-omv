@@ -7,9 +7,10 @@ has been observed failing for the expected missing-schema reasons.
 
 from __future__ import annotations
 
+import tempfile
+import unittest
 from pathlib import Path
 
-import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -30,141 +31,163 @@ EXPECTED_STORY_COLUMNS = {
 }
 
 
-def _sqlite_engine(tmp_path: Path, name: str = "story-schema.db"):
+def _sqlite_engine(directory: str, name: str):
     return create_engine(
-        f"sqlite:///{tmp_path / name}",
+        f"sqlite:///{Path(directory) / name}",
         connect_args={"check_same_thread": False},
     )
 
 
-def test_story_model_exposes_orchestration_columns_and_segment_model() -> None:
-    """The ORM must expose workflow state without replacing existing Story."""
-    story_columns = set(database.Story.__table__.columns.keys())
+class StoryOrchestrationModelRedTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
 
-    assert EXPECTED_STORY_COLUMNS <= story_columns
-    assert hasattr(database, "StorySegment")
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
 
-    segment_model = database.StorySegment
-    assert segment_model.__tablename__ == "story_segments"
-    assert {
-        "id",
-        "story_id",
-        "position",
-        "profile_id",
-        "text",
-        "generation_id",
-        "status",
-        "error",
-        "created_at",
-        "updated_at",
-    } <= set(segment_model.__table__.columns.keys())
+    def test_story_model_exposes_orchestration_columns_and_segment_model(self) -> None:
+        """The ORM must extend the existing Story rather than replace it."""
+        story_columns = set(database.Story.__table__.columns.keys())
 
-
-def test_upgrade_migration_adds_story_workflow_schema_idempotently(tmp_path: Path) -> None:
-    """An existing Voicebox database must upgrade without losing Story rows."""
-    engine = _sqlite_engine(tmp_path, "legacy-story.db")
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE stories (
-                    id VARCHAR PRIMARY KEY,
-                    name VARCHAR NOT NULL,
-                    description TEXT,
-                    created_at DATETIME,
-                    updated_at DATETIME
-                )
-                """
-            )
+        self.assertTrue(
+            EXPECTED_STORY_COLUMNS <= story_columns,
+            f"Missing Story columns: {sorted(EXPECTED_STORY_COLUMNS - story_columns)}",
         )
-        connection.execute(
-            text(
-                """
-                CREATE TABLE profiles (
-                    id VARCHAR PRIMARY KEY,
-                    name VARCHAR NOT NULL
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                """
-                CREATE TABLE generations (
-                    id VARCHAR PRIMARY KEY,
-                    profile_id VARCHAR NOT NULL
-                )
-                """
-            )
-        )
-        connection.execute(
-            text(
-                "INSERT INTO stories (id, name) VALUES ('legacy-story', 'Legacy')"
-            )
-        )
-
-    run_migrations(engine)
-    run_migrations(engine)
-
-    inspector = inspect(engine)
-    assert EXPECTED_STORY_COLUMNS <= {
-        column["name"] for column in inspector.get_columns("stories")
-    }
-    assert "story_segments" in set(inspector.get_table_names())
-
-    with engine.connect() as connection:
-        migrated = connection.execute(
-            text(
-                """
-                SELECT name, status, total_segments, completed_segments
-                FROM stories
-                WHERE id = 'legacy-story'
-                """
-            )
-        ).one()
-
-    assert tuple(migrated) == ("Legacy", "draft", 0, 0)
-
-
-def test_story_segment_position_is_unique_per_story(tmp_path: Path) -> None:
-    """Resume logic depends on one stable segment row per script position."""
-    assert hasattr(database, "StorySegment")
-
-    engine = _sqlite_engine(tmp_path, "unique-position.db")
-    database.Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-
-    try:
-        profile = database.VoiceProfile(id="profile-1", name="Serena")
-        story = database.Story(id="story-1", name="Demo")
-        session.add_all([profile, story])
-        session.commit()
+        self.assertTrue(hasattr(database, "StorySegment"))
 
         segment_model = database.StorySegment
-        session.add(
-            segment_model(
-                id="segment-1",
-                story_id=story.id,
-                position=1,
-                profile_id=profile.id,
-                text="Prima battuta",
-            )
+        self.assertEqual(segment_model.__tablename__, "story_segments")
+        expected_segment_columns = {
+            "id",
+            "story_id",
+            "position",
+            "profile_id",
+            "text",
+            "generation_id",
+            "status",
+            "error",
+            "created_at",
+            "updated_at",
+        }
+        actual_segment_columns = set(segment_model.__table__.columns.keys())
+        self.assertTrue(
+            expected_segment_columns <= actual_segment_columns,
+            f"Missing StorySegment columns: {sorted(expected_segment_columns - actual_segment_columns)}",
         )
-        session.commit()
 
-        session.add(
-            segment_model(
-                id="segment-2",
-                story_id=story.id,
-                position=1,
-                profile_id=profile.id,
-                text="Posizione duplicata",
+    def test_upgrade_migration_adds_story_workflow_schema_idempotently(self) -> None:
+        """An existing Voicebox database upgrades without losing Story rows."""
+        engine = _sqlite_engine(self.temp_dir.name, "legacy-story.db")
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        CREATE TABLE stories (
+                            id VARCHAR PRIMARY KEY,
+                            name VARCHAR NOT NULL,
+                            description TEXT,
+                            created_at DATETIME,
+                            updated_at DATETIME
+                        )
+                        """
+                    )
+                )
+                connection.execute(
+                    text(
+                        """
+                        CREATE TABLE profiles (
+                            id VARCHAR PRIMARY KEY,
+                            name VARCHAR NOT NULL
+                        )
+                        """
+                    )
+                )
+                connection.execute(
+                    text(
+                        """
+                        CREATE TABLE generations (
+                            id VARCHAR PRIMARY KEY,
+                            profile_id VARCHAR NOT NULL
+                        )
+                        """
+                    )
+                )
+                connection.execute(
+                    text("INSERT INTO stories (id, name) VALUES ('legacy-story', 'Legacy')")
+                )
+
+            run_migrations(engine)
+            run_migrations(engine)
+
+            inspector = inspect(engine)
+            actual_story_columns = {
+                column["name"] for column in inspector.get_columns("stories")
+            }
+            self.assertTrue(
+                EXPECTED_STORY_COLUMNS <= actual_story_columns,
+                f"Migration missed columns: {sorted(EXPECTED_STORY_COLUMNS - actual_story_columns)}",
             )
-        )
-        with pytest.raises(IntegrityError):
+            self.assertIn("story_segments", set(inspector.get_table_names()))
+
+            with engine.connect() as connection:
+                migrated = connection.execute(
+                    text(
+                        """
+                        SELECT name, status, total_segments, completed_segments
+                        FROM stories
+                        WHERE id = 'legacy-story'
+                        """
+                    )
+                ).one()
+
+            self.assertEqual(tuple(migrated), ("Legacy", "draft", 0, 0))
+        finally:
+            engine.dispose()
+
+    def test_story_segment_position_is_unique_per_story(self) -> None:
+        """Resume depends on one stable segment row per script position."""
+        self.assertTrue(hasattr(database, "StorySegment"))
+
+        engine = _sqlite_engine(self.temp_dir.name, "unique-position.db")
+        database.Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        session = Session()
+
+        try:
+            profile = database.VoiceProfile(id="profile-1", name="Serena")
+            story = database.Story(id="story-1", name="Demo")
+            session.add_all([profile, story])
             session.commit()
-    finally:
-        session.rollback()
-        session.close()
-        engine.dispose()
+
+            segment_model = database.StorySegment
+            session.add(
+                segment_model(
+                    id="segment-1",
+                    story_id=story.id,
+                    position=1,
+                    profile_id=profile.id,
+                    text="Prima battuta",
+                )
+            )
+            session.commit()
+
+            session.add(
+                segment_model(
+                    id="segment-2",
+                    story_id=story.id,
+                    position=1,
+                    profile_id=profile.id,
+                    text="Posizione duplicata",
+                )
+            )
+            with self.assertRaises(IntegrityError):
+                session.commit()
+        finally:
+            session.rollback()
+            session.close()
+            engine.dispose()
+
+
+if __name__ == "__main__":
+    unittest.main()
