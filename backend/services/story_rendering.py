@@ -23,6 +23,11 @@ from ..utils.audio import load_audio
 from . import stories
 
 
+def _expected_render_path(story_id: str) -> Path:
+    """Return the only filesystem path a persisted Story render may use."""
+    return (config.get_stories_dir() / story_id / "story.wav").resolve()
+
+
 async def validate_render_inputs(story_id: str, db: Session) -> None:
     """Require every Story item to reference completed, readable audio."""
     story = db.query(DBStory).filter_by(id=story_id).first()
@@ -65,7 +70,11 @@ async def validate_render_inputs(story_id: str, db: Session) -> None:
             )
 
         try:
-            await asyncio.to_thread(load_audio, str(audio_path), sample_rate=24_000)
+            await asyncio.to_thread(
+                load_audio,
+                str(audio_path),
+                sample_rate=24_000,
+            )
         except Exception as exc:
             raise ValueError(
                 f"Story segment audio is missing or unreadable: {generation.id}"
@@ -87,10 +96,9 @@ async def render_story_persistent(story_id: str, db: Session) -> str:
     if story is None:
         raise ValueError(f"Story '{story_id}' was not found")
 
-    story_dir = config.get_stories_dir() / story_id
-    story_dir.mkdir(parents=True, exist_ok=True)
-    final_path = story_dir / "story.wav"
-    temporary_path = story_dir / "story.wav.tmp"
+    final_path = _expected_render_path(story_id)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = final_path.with_name("story.wav.tmp")
 
     try:
         with temporary_path.open("wb") as output:
@@ -111,20 +119,33 @@ async def render_story_persistent(story_id: str, db: Session) -> str:
 
 
 def resolve_valid_render_path(story: DBStory) -> Path | None:
-    """Resolve a persisted render only when it still exists as a regular file."""
+    """Resolve a persisted render only inside its fixed Story directory."""
     path = config.resolve_storage_path(story.render_audio_path)
-    return path if path is not None and path.is_file() else None
+    expected = _expected_render_path(story.id)
+    if path is None:
+        return None
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    return resolved if resolved == expected and resolved.is_file() else None
 
 
 def remove_persistent_render(story: DBStory) -> None:
     """Remove a Story render and clear its in-memory render metadata."""
     path = config.resolve_storage_path(story.render_audio_path)
+    expected = _expected_render_path(story.id)
     if path is not None:
-        path.unlink(missing_ok=True)
         try:
-            path.parent.rmdir()
+            resolved = path.resolve()
         except OSError:
-            pass
+            resolved = None
+        if resolved == expected:
+            resolved.unlink(missing_ok=True)
+            try:
+                resolved.parent.rmdir()
+            except OSError:
+                pass
     story.render_audio_path = None
     story.rendered_at = None
 
