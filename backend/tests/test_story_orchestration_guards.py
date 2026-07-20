@@ -67,10 +67,17 @@ class StoryOrchestrationGuardTestCase(unittest.IsolatedAsyncioTestCase):
         config.set_data_dir(self.original_data_dir)
 
     def test_background_task_creation_failure_does_not_leak_active_registry(self) -> None:
+        def reject_task(coroutine):
+            # The mock takes ownership of the coroutine just as a real task
+            # scheduler would. Closing it keeps this failure-path test free of
+            # false "coroutine was never awaited" warnings.
+            coroutine.close()
+            raise RuntimeError("no loop")
+
         with patch.object(
             orchestration,
             "create_background_task",
-            side_effect=RuntimeError("no loop"),
+            side_effect=reject_task,
         ):
             with self.assertRaisesRegex(RuntimeError, "no loop"):
                 orchestration.start_story_workflow("story-1")
