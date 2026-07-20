@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_CONTEXT="${VOICEBOX_BUILD_CONTEXT:-$ROOT_DIR}"
 IMAGE_NAME="${IMAGE_NAME:-voicebox-mcp-story:test}"
 CONTAINER_NAME="${CONTAINER_NAME:-voicebox-mcp-story-test}"
 DATA_VOLUME="${DATA_VOLUME:-voicebox-mcp-story-test-data}"
@@ -17,13 +18,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cd "$ROOT_DIR"
-
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || true
 
-echo "[1/7] Building the existing Voicebox Docker image..."
-docker build -t "$IMAGE_NAME" .
+echo "[1/7] Building the Voicebox Story branch..."
+docker build -t "$IMAGE_NAME" "$BUILD_CONTEXT"
 
 echo "[2/7] Starting an isolated Voicebox container..."
 docker volume create "$DATA_VOLUME" >/dev/null
@@ -58,6 +57,7 @@ docker exec "$CONTAINER_NAME" python -m unittest \
   backend.tests.test_story_profile_resolution \
   backend.tests.test_story_rendering \
   backend.tests.test_story_orchestration \
+  backend.tests.test_story_orchestration_guards \
   backend.tests.test_mcp_story_tools \
   backend.tests.test_story_http_compatibility \
   backend.tests.test_story_restart_recovery \
